@@ -22,21 +22,40 @@
 # License along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 ##############################################################################
+
+
 from spack import *
 
 
-class Bison(AutotoolsPackage):
-    """Bison is a general-purpose parser generator that converts
-    an annotated context-free grammar into a deterministic LR or
-    generalized LR (GLR) parser employing LALR(1) parser tables."""
+class Funhpc(CMakePackage):
+    """FunHPC: Functional HPC Programming"""
+    homepage = "https://github.com/eschnett/FunHPC.cxx"
+    url = "https://github.com/eschnett/FunHPC.cxx/archive/version/0.1.0.tar.gz"
 
-    homepage = "http://www.gnu.org/software/bison/"
-    url      = "http://ftp.gnu.org/gnu/bison/bison-3.0.tar.gz"
+    version('1.1.1', '7b9ef638b02fffe35b75517e8eeff580')
+    version('1.1.0', '897bd968c42cd4f14f86fcf67da70444')
+    version('1.0.0', 'f34e71ccd5548b42672e692c913ba5ee')
+    version('0.1.1', 'f0248710f2de88ed2a595ad40d99997c')
+    version('0.1.0', '00f7dabc08ed1ab77858785ce0809f50')
+    version('develop',
+            git='https://github.com/eschnett/FunHPC.cxx', branch='master')
 
-    version('3.0.4', 'a586e11cd4aff49c3ff6d3b6a4c9ccf8')
+    variant('pic', default=True,
+            description="Produce position-independent code")
 
-    depends_on('m4', type=('build', 'run'))
+    depends_on('cereal')
+    depends_on('hwloc')
+    depends_on('jemalloc')
+    depends_on('mpi')
+    depends_on('qthreads')
 
-    patch('pgi.patch', when='@3.0.4')
+    def cmake_args(self):
+        spec = self.spec
+        options = []
+        if '+pic' in spec:
+            options.extend(["-DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=true"])
+        return options
 
-    build_directory = 'spack-build'
+    def check(self):
+        with working_dir(self.build_directory):
+            make("test", "CTEST_OUTPUT_ON_FAILURE=1")
