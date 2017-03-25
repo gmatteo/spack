@@ -48,6 +48,7 @@ class Abinit(Package):
     url      = "http://ftp.abinit.org/abinit-8.0.8b.tar.gz"
 
     # Versions before 8.0.8b are not supported.
+    version("8.2.2", "5f25250e06fdc0815c224ffd29858860")
     version("8.0.8b", "abc9e303bfa7f9f43f95598f87d84d5d")
 
     variant('mpi', default=True,
