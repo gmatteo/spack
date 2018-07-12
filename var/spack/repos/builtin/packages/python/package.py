@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -27,16 +27,18 @@ import os
 import platform
 import re
 import sys
-from contextlib import closing
+import shutil
 
-import spack
 import llnl.util.tty as tty
 from llnl.util.lang import match_predicate
-from llnl.util.filesystem import force_remove
-from spack import *
-from spack.util.environment import *
-from spack.util.prefix import Prefix
+from llnl.util.filesystem import (force_remove, get_filetype,
+                                  path_contains_subdirectory)
+
+import spack.store
 import spack.util.spack_json as sjson
+from spack.util.environment import is_system_path
+from spack.util.prefix import Prefix
+from spack import *
 
 
 class Python(AutotoolsPackage):
@@ -47,6 +49,11 @@ class Python(AutotoolsPackage):
     list_url = "https://www.python.org/downloads/"
     list_depth = 1
 
+    version('3.7.0', '41b6595deb4147a1ed517a7d9a580271')
+    version('3.6.5', 'ab25d24b1f8cc4990ade979f6dc37883')
+    version('3.6.4', '9de6494314ea199e3633211696735f65')
+    version('3.6.3', 'e9180c69ed9a878a4a8a3ab221e32fa9')
+    version('3.6.2', 'e1a36bfffdd1d3a780b1825daf16e56c')
     version('3.6.1', '2d0fc9f3a5940707590e07f03ecb08b9')
     version('3.6.0', '3f7062ccf8be76491884d0e47ac8b251')
     version('3.5.2', '3fe8434643a78630c61c6464fe2e7e72')
@@ -56,7 +63,9 @@ class Python(AutotoolsPackage):
     version('3.3.6', 'cdb3cd08f96f074b3f3994ccb51063e9')
     version('3.2.6', '23815d82ae706e9b781ca65865353d39')
     version('3.1.5', '02196d3fc7bc76bdda68aa36b0dd16ab')
-    version('2.7.13', '17add4bf0ad0ec2f08e0cae6d205c700', preferred=True)
+    version('2.7.15', '045fb3440219a1f6923fefdabde63342', preferred=True)
+    version('2.7.14', 'cee2e4b33ad3750da77b2e85f2f8b724')
+    version('2.7.13', '17add4bf0ad0ec2f08e0cae6d205c700')
     version('2.7.12', '88d61f82e3616a4be952828b3694109d')
     version('2.7.11', '6b6076ec9e93f05dd63e47eb9c15728b')
     version('2.7.10', 'd7547558fd673bd9d38e2108c6b42521')
@@ -79,6 +88,19 @@ class Python(AutotoolsPackage):
     # builds then use a 32-bit type for Py_UNICODE and store Unicode data
     # internally as UCS4. Note that UCS2 and UCS4 Python builds are not binary
     # compatible.
+    variant('pic', default=True,
+            description='Produce position-independent code (for shared libs)')
+
+    variant('dbm', default=True, description='Provide support for dbm')
+    variant(
+        'optimizations',
+        default=False,
+        description='Enable expensive build-time optimizations, if available'
+    )
+    # See https://legacy.python.org/dev/peps/pep-0394/
+    variant('pythoncmd', default=True,
+            description="Symlink 'python3' executable to 'python' "
+            "(not PEP 394 compliant)")
 
     depends_on("openssl")
     depends_on("bzip2")
@@ -88,13 +110,29 @@ class Python(AutotoolsPackage):
     depends_on("zlib")
     depends_on("tk", when="+tk")
     depends_on("tcl", when="+tk")
+    depends_on("gdbm", when='+dbm')
 
     # Patch does not work for Python 3.1
     patch('ncurses.patch', when='@:2.8,3.2:')
 
+    # Ensure that distutils chooses correct compiler option for RPATH on cray:
+    patch('cray-rpath-2.3.patch', when="@2.3:3.0.1 platform=cray")
+    patch('cray-rpath-3.1.patch', when="@3.1:3.99  platform=cray")
+
+    # For more information refer to this bug report:
+    # https://bugs.python.org/issue29712
+    conflicts(
+        '@:2.8 +shared',
+        when='+optimizations',
+        msg='+optimizations is incompatible with +shared in python@2.X'
+    )
+
     _DISTUTIL_VARS_TO_SAVE = ['LDSHARED']
     _DISTUTIL_CACHE_FILENAME = 'sysconfig.json'
     _distutil_vars = None
+
+    # An in-source build with --enable-optimizations fails for python@3.X
+    build_directory = 'spack-build'
 
     @when('@2.7:2.8,3.4:')
     def patch(self):
@@ -110,7 +148,6 @@ class Python(AutotoolsPackage):
 
     def setup_environment(self, spack_env, run_env):
         spec = self.spec
-        prefix = self.prefix
 
         # TODO: The '--no-user-cfg' option for Python installation is only in
         # Python v2.7 and v3.4+ (see https://bugs.python.org/issue1180) and
@@ -121,8 +158,6 @@ class Python(AutotoolsPackage):
                       'user configurations are present.').format(self.version))
 
         # Need this to allow python build to find the Python installation.
-        spack_env.set('PYTHONHOME', prefix)
-        spack_env.set('PYTHONPATH', prefix)
         spack_env.set('MACOSX_DEPLOYMENT_TARGET', platform.mac_ver()[0])
 
     def configure_args(self):
@@ -136,11 +171,22 @@ class Python(AutotoolsPackage):
             'CPPFLAGS=-I{0}'.format(' -I'.join(dp.include for dp in dep_pfxs)),
             'LDFLAGS=-L{0}'.format(' -L'.join(dp.lib for dp in dep_pfxs)),
         ]
+
+        if spec.satisfies('@2.7.13:2.8,3.5.3:', strict=True) \
+                and '+optimizations' in spec:
+            config_args.append('--enable-optimizations')
+
         if spec.satisfies('%gcc platform=darwin'):
             config_args.append('--disable-toolbox-glue')
 
+        if spec.satisfies('%intel', strict=True) and \
+                spec.satisfies('@2.7.12:2.8,3.5.2:', strict=True):
+            config_args.append('--with-icc')
+
         if '+shared' in spec:
             config_args.append('--enable-shared')
+        else:
+            config_args.append('--disable-shared')
 
         if '+ucs4' in spec:
             if spec.satisfies('@:2.7'):
@@ -154,6 +200,9 @@ class Python(AutotoolsPackage):
 
         if spec.satisfies('@3:'):
             config_args.append('--without-ensurepip')
+
+        if '+pic' in spec:
+            config_args.append('CFLAGS={0}'.format(self.compiler.pic_flag))
 
         return config_args
 
@@ -189,6 +238,12 @@ class Python(AutotoolsPackage):
             for f in os.listdir(src):
                 os.symlink(os.path.join(src, f),
                            os.path.join(dst, f))
+
+        if spec.satisfies('@3:') and spec.satisfies('+pythoncmd'):
+            os.symlink(os.path.join(prefix.bin, 'python3'),
+                       os.path.join(prefix.bin, 'python'))
+            os.symlink(os.path.join(prefix.bin, 'python3-config'),
+                       os.path.join(prefix.bin, 'python-config'))
 
     # TODO: Once better testing support is integrated, add the following tests
     # https://wiki.python.org/moin/TkInter
@@ -273,7 +328,7 @@ class Python(AutotoolsPackage):
                     Python._DISTUTIL_CACHE_FILENAME)
                 with open(output_filename, 'w') as output_file:
                     sjson.dump(self._distutil_vars, output_file)
-            except:
+            except Exception:
                 tty.warn("Failed to save metadata for distutils. This might "
                          "cause the extensions that are installed with "
                          "distutils to call compilers directly avoiding "
@@ -296,7 +351,7 @@ class Python(AutotoolsPackage):
                 if os.path.isfile(input_filename):
                     with open(input_filename) as input_file:
                         self._distutil_vars = sjson.load(input_file)
-            except:
+            except Exception:
                 pass
 
             if not self._distutil_vars:
@@ -484,15 +539,27 @@ class Python(AutotoolsPackage):
     def site_packages_dir(self):
         return join_path(self.python_lib_dir, 'site-packages')
 
+    @property
+    def easy_install_file(self):
+        return join_path(self.site_packages_dir, "easy-install.pth")
+
     def setup_dependent_environment(self, spack_env, run_env, dependent_spec):
         """Set PYTHONPATH to include the site-packages directory for the
         extension and any other python extensions it depends on."""
 
+        # If we set PYTHONHOME, we must also ensure that the corresponding
+        # python is found in the build environment. This to prevent cases
+        # where a system provided python is run against the standard libraries
+        # of a Spack built python. See issue #7128
         spack_env.set('PYTHONHOME', self.home)
+
+        path = os.path.dirname(self.command.path)
+        if not is_system_path(path):
+            spack_env.prepend_path('PATH', path)
 
         python_paths = []
         for d in dependent_spec.traverse(
-                deptype=('build', 'run'), deptype_query='run'):
+                deptype=('build', 'run', 'test')):
             if d.package.extends(self.spec):
                 python_paths.append(join_path(d.prefix,
                                               self.site_packages_dir))
@@ -531,6 +598,8 @@ class Python(AutotoolsPackage):
         module.site_packages_dir = join_path(dependent_spec.prefix,
                                              self.site_packages_dir)
 
+        self.spec.home = self.home
+
         # Make the site packages directory for extensions
         if dependent_spec.package.is_extension:
             mkdirp(module.site_packages_dir)
@@ -563,16 +632,20 @@ class Python(AutotoolsPackage):
 
         return match_predicate(ignore_arg, patterns)
 
-    def write_easy_install_pth(self, exts):
+    def write_easy_install_pth(self, exts, prefix=None):
+        if not prefix:
+            prefix = self.prefix
+
         paths = []
+        unique_paths = set()
+
         for ext in sorted(exts.values()):
-            ext_site_packages = join_path(ext.prefix, self.site_packages_dir)
-            easy_pth = join_path(ext_site_packages, "easy-install.pth")
+            easy_pth = join_path(ext.prefix, self.easy_install_file)
 
             if not os.path.isfile(easy_pth):
                 continue
 
-            with closing(open(easy_pth)) as f:
+            with open(easy_pth) as f:
                 for line in f:
                     line = line.rstrip()
 
@@ -585,17 +658,18 @@ class Python(AutotoolsPackage):
                             re.search(r'setuptools.*egg$', line)):
                         continue
 
-                    paths.append(line)
+                    if line not in unique_paths:
+                        unique_paths.add(line)
+                        paths.append(line)
 
-        site_packages = join_path(self.home, self.site_packages_dir)
-        main_pth = join_path(site_packages, "easy-install.pth")
+        main_pth = join_path(prefix, self.easy_install_file)
 
         if not paths:
             if os.path.isfile(main_pth):
                 os.remove(main_pth)
 
         else:
-            with closing(open(main_pth, 'w')) as f:
+            with open(main_pth, 'w') as f:
                 f.write("import sys; sys.__plen = len(sys.path)\n")
                 for path in paths:
                     f.write("{0}\n".format(path))
@@ -605,22 +679,49 @@ class Python(AutotoolsPackage):
                         "sys.path[p:p]=new; "
                         "sys.__egginsert = p+len(new)\n")
 
-    def activate(self, ext_pkg, **args):
+    def activate(self, ext_pkg, view, **args):
         ignore = self.python_ignore(ext_pkg, args)
         args.update(ignore=ignore)
 
-        super(Python, self).activate(ext_pkg, **args)
+        super(Python, self).activate(ext_pkg, view, **args)
 
-        exts = spack.store.layout.extension_map(self.spec)
+        extensions_layout = view.extensions_layout
+        exts = extensions_layout.extension_map(self.spec)
         exts[ext_pkg.name] = ext_pkg.spec
-        self.write_easy_install_pth(exts)
 
-    def deactivate(self, ext_pkg, **args):
+        self.write_easy_install_pth(exts, prefix=view.root)
+
+    def deactivate(self, ext_pkg, view, **args):
         args.update(ignore=self.python_ignore(ext_pkg, args))
-        super(Python, self).deactivate(ext_pkg, **args)
 
-        exts = spack.store.layout.extension_map(self.spec)
+        super(Python, self).deactivate(ext_pkg, view, **args)
+
+        extensions_layout = view.extensions_layout
+        exts = extensions_layout.extension_map(self.spec)
         # Make deactivate idempotent
         if ext_pkg.name in exts:
             del exts[ext_pkg.name]
-            self.write_easy_install_pth(exts)
+            self.write_easy_install_pth(exts, prefix=view.root)
+
+    def add_files_to_view(self, view, merge_map):
+        bin_dir = self.spec.prefix.bin
+        for src, dst in merge_map.items():
+            if not path_contains_subdirectory(src, bin_dir):
+                view.link(src, dst)
+            elif not os.path.islink(src):
+                shutil.copy2(src, dst)
+                if 'script' in get_filetype(src):
+                    filter_file(
+                        self.spec.prefix, os.path.abspath(view.root), dst)
+            else:
+                orig_link_target = os.path.realpath(src)
+                new_link_target = os.path.abspath(merge_map[orig_link_target])
+                view.link(new_link_target, dst)
+
+    def remove_files_from_view(self, view, merge_map):
+        bin_dir = self.spec.prefix.bin
+        for src, dst in merge_map.items():
+            if not path_contains_subdirectory(src, bin_dir):
+                view.remove_file(src, dst)
+            else:
+                os.remove(dst)

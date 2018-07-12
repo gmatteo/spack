@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -27,10 +27,10 @@ from six import iteritems
 
 from llnl.util.lang import classproperty
 
-import spack
+import spack.repo
 import spack.error
 from spack.util.path import canonicalize_path
-from spack.version import *
+from spack.version import VersionList
 
 
 _lesser_spec_types = {'compiler': spack.spec.CompilerSpec,
@@ -44,14 +44,14 @@ def _spec_type(component):
 
 def get_packages_config():
     """Wrapper around get_packages_config() to validate semantics."""
-    config = spack.config.get_config('packages')
+    config = spack.config.get('packages')
 
     # Get a list of virtuals from packages.yaml.  Note that because we
     # check spack.repo, this collects virtuals that are actually provided
     # by sometihng, not just packages/names that don't exist.
     # So, this won't include, e.g., 'all'.
     virtuals = [(pkg_name, pkg_name._start_mark) for pkg_name in config
-                if spack.repo.is_virtual(pkg_name)]
+                if spack.repo.path.is_virtual(pkg_name)]
 
     # die if there are virtuals in `packages.py`
     if virtuals:
@@ -112,9 +112,17 @@ class PackagePrefs(object):
 
         # integer is the index of the first spec in order that satisfies
         # spec, or it's a number larger than any position in the order.
-        return next(
+        match_index = next(
             (i for i, s in enumerate(spec_order) if spec.satisfies(s)),
             len(spec_order))
+        if match_index < len(spec_order) and spec_order[match_index] == spec:
+            # If this is called with multiple specs that all satisfy the same
+            # minimum index in spec_order, the one which matches that element
+            # of spec_order exactly is considered slightly better. Note
+            # that because this decreases the value by less than 1, it is not
+            # better than a match which occurs at an earlier index.
+            match_index -= 0.5
+        return match_index
 
     @classproperty
     @classmethod
@@ -200,7 +208,7 @@ def spec_externals(spec):
     """Return a list of external specs (w/external directory path filled in),
        one for each known external installation."""
     # break circular import.
-    from spack.build_environment import get_path_from_module  # noqa: F401
+    from spack.util.module_cmd import get_path_from_module # NOQA: ignore=F401
 
     allpkgs = get_packages_config()
     name = spec.name

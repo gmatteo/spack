@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -79,16 +79,15 @@ import os
 import inspect
 import platform as py_platform
 
-from llnl.util.lang import memoized, list_modules, key_ordering
-from llnl.util.filesystem import join_path
+import llnl.util.multiproc as mp
 import llnl.util.tty as tty
+from llnl.util.lang import memoized, list_modules, key_ordering
 
-import spack
+import spack.paths
+import spack.error as serr
 from spack.util.naming import mod_to_class
 from spack.util.environment import get_path
-from spack.util.multiproc import parmap
 from spack.util.spack_yaml import syaml_dict
-import spack.error as serr
 
 
 class NoPlatformError(serr.SpackError):
@@ -240,8 +239,8 @@ class OperatingSystem(object):
     """
 
     def __init__(self, name, version):
-        self.name = name
-        self.version = version
+        self.name = name.replace('-', '_')
+        self.version = str(version).replace('-', '_')
 
     def __str__(self):
         return "%s%s" % (self.name, self.version)
@@ -254,7 +253,7 @@ class OperatingSystem(object):
 
     def find_compilers(self, *paths):
         """
-        Return a list of compilers found in the suppied paths.
+        Return a list of compilers found in the supplied paths.
         This invokes the find() method for each Compiler class,
         and appends the compilers detected to a list.
         """
@@ -271,7 +270,7 @@ class OperatingSystem(object):
             filtered_path.append(p)
 
             # Check for a bin directory, add it if it exists
-            bin = join_path(p, 'bin')
+            bin = os.path.join(p, 'bin')
             if os.path.isdir(bin):
                 filtered_path.append(os.path.realpath(bin))
 
@@ -281,9 +280,9 @@ class OperatingSystem(object):
         # NOTE: we import spack.compilers here to avoid init order cycles
         import spack.compilers
         types = spack.compilers.all_compiler_types()
-        compiler_lists = parmap(lambda cmp_cls:
-                                self.find_compiler(cmp_cls, *filtered_path),
-                                types)
+        compiler_lists = mp.parmap(
+            lambda cmp_cls: self.find_compiler(cmp_cls, *filtered_path),
+            types)
 
         # ensure all the version calls we made are cached in the parent
         # process, as well.  This speeds up Spack a lot.
@@ -301,7 +300,7 @@ class OperatingSystem(object):
            prefixes, suffixes, and versions.  e.g., gcc-mp-4.7 would
            be grouped with g++-mp-4.7 and gfortran-mp-4.7.
         """
-        dicts = parmap(
+        dicts = mp.parmap(
             lambda t: cmp_cls._find_matches_in_path(*t),
             [(cmp_cls.cc_names,  cmp_cls.cc_version)  + tuple(path),
              (cmp_cls.cxx_names, cmp_cls.cxx_version) + tuple(path),
@@ -463,7 +462,7 @@ def arch_for_spec(arch_spec):
 @memoized
 def all_platforms():
     classes = []
-    mod_path = spack.platform_path
+    mod_path = spack.paths.platform_path
     parent_module = "spack.platforms"
 
     for name in list_modules(mod_path):

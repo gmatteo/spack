@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -38,7 +38,9 @@ class Kaldi(Package):    # Does not use Autotools
     url      = "https://github.com/kaldi-asr/kaldi/archive/master.zip"
 
     version('master', git='https://github.com/kaldi-asr/kaldi.git')
-    version('c024e8', git='https://github.com/kaldi-asr/kaldi.git',
+    version('2018-07-11', git='https://github.com/kaldi-asr/kaldi.git',
+            commit='6f2140b032b0108bc313eefdca65151289642773')
+    version('2015-10-07', git='https://github.com/kaldi-asr/kaldi.git',
             commit='c024e8aa0a727bf76c91a318f76a1f8b0b59249e')
 
     variant('shared', default=True,
@@ -53,18 +55,16 @@ class Kaldi(Package):    # Does not use Autotools
     depends_on('sph2pipe', type='run')
     depends_on('sctk', type='run')
     depends_on('speex', type='run')
-    depends_on('openfst@1.4.1-patch', when='@c024e8')
+    depends_on('openfst@1.4.1-patch', when='@2015-10-07')
+    depends_on('openfst@1.6.0:', when='@2018-07-11')
     depends_on('openfst')
 
-    patch('openfst-1.4.1.patch', when='@c024e8')
+    patch('openfst-1.4.1.patch', when='@2015-10-07')
 
     def install(self, spec, prefix):
         configure_args = ['--fst-root=' + spec['openfst'].prefix]
-
-        if spec.satisfies('c024e8'):
-            configure_args.append('--speex-root=' + spec['speex'].prefix)
-            configure_args.append('--fst-version=' +
-                                  str(spec['openfst'].version))
+        configure_args.append('--fst-version=' + str(spec['openfst'].version))
+        configure_args.append('--speex-root=' + spec['speex'].prefix)
 
         if '~shared' in spec:
             configure_args.append('--static')
@@ -96,8 +96,13 @@ class Kaldi(Package):    # Does not use Autotools
             make()
 
             mkdirp(prefix.bin)
-            for root, dirs, files in os.walk('bin'):
+            for root, dirs, files in os.walk('.'):
                 for name in files:
+                    if name.endswith(".so") or name.endswith(".cc") \
+                            or name.endswith(".pptx"):
+                        continue
+                    if "configure" is name:
+                        continue
                     if os.access(join(root, name), os.X_OK):
                         install(join(root, name), prefix.bin)
 

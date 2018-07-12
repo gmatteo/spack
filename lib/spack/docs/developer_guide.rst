@@ -119,7 +119,7 @@ etc.) but we wanted to make Spack *very* easy to use.  The simple layout
 spares users from the need to install Spack into a Python environment.
 Many users don't have write access to a Python installation, and installing
 an entire new instance of Python to bootstrap Spack would be very complicated.
-Users should not have to install install a big, complicated package to
+Users should not have to install a big, complicated package to
 use the thing that's supposed to spare them from the details of big,
 complicated packages.  The end result is that Spack works out of the
 box: clone it and add ``bin`` to your PATH and you're ready to go.
@@ -335,6 +335,10 @@ can be added to an existing command. Also remember to add unit tests for
 your command. If it isn't used very frequently, changes to the rest of
 Spack can cause your command to break without sufficient unit tests to
 prevent this from happening.
+
+Whenever you add/remove/rename a command or flags for an existing command,
+make sure to update Spack's `Bash tab completion script
+<https://github.com/adamjstewart/spack/blob/develop/share/spack/spack-completion.bash>`_.
 
 ----------
 Unit tests

@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -26,13 +26,14 @@ from spack import *
 
 
 class Pigz(MakefilePackage):
-    """A parallel implementation of gzip for modern multi-processor, 
+    """A parallel implementation of gzip for modern multi-processor,
        multi-core machines."""
 
     homepage = "http://zlib.net/pigz/"
-    url      = "http://zlib.net/pigz/pigz-2.3.4.tar.gz"
+    url      = "https://github.com/madler/pigz/archive/v2.3.4.tar.gz"
 
-    version('2.3.4', '08e6b2e682bbf65ccf12c8966d633fc6')
+    version('2.4', '3c8a601db141d3013ef9fe5f2daaf73f')
+    version('2.3.4', 'c109057050b15edf3eb9bb4d0805235e')
 
     depends_on('zlib')
 
@@ -41,6 +42,6 @@ class Pigz(MakefilePackage):
 
     def install(self, spec, prefix):
         mkdirp(prefix.bin)
-        mkdirp(prefix.man1)
+        mkdirp(prefix.man.man1)
         install('pigz', "%s/pigz" % prefix.bin)
-        install('pigz.1', "%s/pigz.1" % prefix.man1)
+        install('pigz.1', "%s/pigz.1" % prefix.man.man1)

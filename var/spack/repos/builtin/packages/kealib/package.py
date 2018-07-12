@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -25,8 +25,8 @@
 from spack import *
 
 
-class Kealib(Package):
-    """An HDF5 Based Raster File Format
+class Kealib(CMakePackage):
+    """An HDF5 Based Raster File Format.
 
     KEALib provides an implementation of the GDAL data model.
     The format supports raster attribute tables, image pyramids,
@@ -41,21 +41,37 @@ class Kealib(Package):
 
     Development work on this project has been funded by Landcare Research.
     """
-    homepage = "http://kealib.org/"
-    url      = "https://bitbucket.org/chchrsc/kealib/get/kealib-1.4.5.tar.gz"
+    homepage = "http://www.kealib.org/"
+    url      = "https://bitbucket.org/chchrsc/kealib/get/kealib-1.4.9.tar.gz"
 
-    version('1.4.5', '112e9c42d980b2d2987a3c15d0833a5d')
+    version('develop', hg='https://bitbucket.org/chchrsc/kealib')
+    version('1.4.9', 'a095d0b9d6de1d609ffaf242e00cc2b6')
+    version('1.4.8', '1af2514c908f9168ff6665cc012815ad')
+    version('1.4.7', '6139e31e50f552247ddf98f489948893')
 
-    depends_on("hdf5")
+    depends_on('cmake@2.8.10:', type='build')
+    depends_on('hdf5+cxx+hl')
 
-    def install(self, spec, prefix):
-        with working_dir('trunk', create=False):
-            cmake_args = []
-            cmake_args.append("-DCMAKE_INSTALL_PREFIX=%s" % prefix)
-            cmake_args.append("-DHDF5_INCLUDE_DIR=%s" %
-                              spec['hdf5'].prefix.include)
-            cmake_args.append("-DHDF5_LIB_PATH=%s" % spec['hdf5'].prefix.lib)
-            cmake('.', *cmake_args)
+    patch('cmake.patch', when='@1.4.7')
 
-            make()
-            make("install")
+    @property
+    def root_cmakelists_dir(self):
+        if self.version >= Version('1.4.9'):
+            return '.'
+        else:
+            return 'trunk'
+
+    def cmake_args(self):
+        spec = self.spec
+
+        if self.version >= Version('1.4.9'):
+            return [
+                '-DHDF5_ROOT={0}'.format(spec['hdf5'].prefix)
+            ]
+        else:
+            return [
+                '-DHDF5_INCLUDE_DIR={0}'.format(
+                    spec['hdf5'].headers.directories[0]),
+                '-DHDF5_LIB_PATH={0}'.format(
+                    spec['hdf5'].libs.directories[0])
+            ]

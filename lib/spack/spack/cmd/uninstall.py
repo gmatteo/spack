@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -26,14 +26,16 @@ from __future__ import print_function
 
 import argparse
 
-import spack
 import spack.cmd
+import spack.package
+import spack.repo
 import spack.store
-import spack.repository
 
 from llnl.util import tty
 
-description = "remove an installed package"
+description = "remove installed packages"
+section = "build"
+level = "short"
 
 error_message = """You can either:
     a) use a more specific spec, or
@@ -126,8 +128,9 @@ def installed_dependents(specs):
     """
     dependents = {}
     for item in specs:
-        lst = [x for x in spack.store.db.installed_dependents(item)
-               if x not in specs]
+        installed = spack.store.db.installed_relatives(
+            item, 'parents', True)
+        lst = [x for x in installed if x not in specs]
         if lst:
             lst = list(set(lst))
             dependents[item] = lst
@@ -147,15 +150,17 @@ def do_uninstall(specs, force):
         try:
             # should work if package is known to spack
             packages.append(item.package)
-        except spack.repository.UnknownEntityError:
+        except spack.repo.UnknownEntityError:
             # The package.py file has gone away -- but still
             # want to uninstall.
-            spack.Package.uninstall_by_spec(item, force=True)
+            spack.package.Package.uninstall_by_spec(item, force=True)
 
     # Sort packages to be uninstalled by the number of installed dependents
     # This ensures we do things in the right order
     def num_installed_deps(pkg):
-        return len(spack.store.db.installed_dependents(pkg.spec))
+        dependents = spack.store.db.installed_relatives(
+            pkg.spec, 'parents', True)
+        return len(dependents)
 
     packages.sort(key=num_installed_deps)
     for item in packages:
@@ -178,8 +183,7 @@ def get_uninstall_list(args):
     has_error = False
     if dependent_list and not args.dependents and not args.force:
         for spec, lst in dependent_list.items():
-            tty.error('Will not uninstall {0}'.format(
-                      spec.format("$_$@$%@$/", color=True)))
+            tty.error("Will not uninstall %s" % spec.cformat("$_$@$%@$/"))
             print('')
             print('The following packages depend on it:')
             spack.cmd.display_specs(lst, **display_args)

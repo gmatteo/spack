@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -23,7 +23,7 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 ##############################################################################
 from spack import *
-from spack import spack_root
+from spack.paths import spack_root
 
 
 class GobjectIntrospection(Package):
@@ -44,6 +44,10 @@ class GobjectIntrospection(Package):
     depends_on("cairo")
     depends_on("bison", type="build")
     depends_on("flex", type="build")
+    depends_on("pkgconfig", type="build")
+
+    # GobjectIntrospection does not build with sed from darwin:
+    depends_on('sed', when='platform=darwin', type='build')
 
     # This package creates several scripts from
     # toosl/g-ir-tool-template.in.  In their original form these

@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -24,24 +24,28 @@
 ##############################################################################
 import collections
 import errno
+import hashlib
 import fileinput
-import fnmatch
 import glob
+import grp
 import numbers
 import os
+import pwd
 import re
 import shutil
-import six
 import stat
-import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 
+import six
 from llnl.util import tty
 from llnl.util.lang import dedupe
+from spack.util.executable import Executable
 
 __all__ = [
     'FileFilter',
+    'FileList',
     'HeaderList',
     'LibraryList',
     'ancestor',
@@ -73,6 +77,18 @@ __all__ = [
     'unset_executable_mode',
     'working_dir'
 ]
+
+
+def path_contains_subdirectory(path, root):
+    norm_root = os.path.abspath(root).rstrip(os.path.sep) + os.path.sep
+    norm_path = os.path.abspath(path).rstrip(os.path.sep) + os.path.sep
+    return norm_path.startswith(norm_root)
+
+
+def same_path(path1, path2):
+    norm1 = os.path.abspath(path1).rstrip(os.path.sep)
+    norm2 = os.path.abspath(path2).rstrip(os.path.sep)
+    return norm1 == norm2
 
 
 def filter_file(regex, repl, *filenames, **kwargs):
@@ -116,9 +132,15 @@ def filter_file(regex, repl, *filenames, **kwargs):
         regex = re.escape(regex)
 
     for filename in filenames:
+
+        msg = 'FILTER FILE: {0} [replacing "{1}"]'
+        tty.debug(msg.format(filename, regex))
+
         backup_filename = filename + "~"
 
         if ignore_absent and not os.path.exists(filename):
+            msg = 'FILTER FILE: file "{0}" not found. Skipping to next file.'
+            tty.debug(msg.format(filename))
             continue
 
         # Create backup file. Don't overwrite an existing backup
@@ -129,13 +151,13 @@ def filter_file(regex, repl, *filenames, **kwargs):
         try:
             for line in fileinput.input(filename, inplace=True):
                 print(re.sub(regex, repl, line.rstrip('\n')))
-        except:
+        except BaseException:
             # clean up the original file on failure.
             shutil.move(backup_filename, filename)
             raise
 
         finally:
-            if not backup:
+            if not backup and os.path.exists(backup_filename):
                 os.remove(backup_filename)
 
 
@@ -193,13 +215,37 @@ def change_sed_delimiter(old_delim, new_delim, *filenames):
 
 def set_install_permissions(path):
     """Set appropriate permissions on the installed file."""
+    # If this points to a file maintained in a Spack prefix, it is assumed that
+    # this function will be invoked on the target. If the file is outside a
+    # Spack-maintained prefix, the permissions should not be modified.
+    if os.path.islink(path):
+        return
     if os.path.isdir(path):
         os.chmod(path, 0o755)
     else:
         os.chmod(path, 0o644)
 
 
+def group_ids(uid=None):
+    """Get group ids that a uid is a member of.
+
+    Arguments:
+        uid (int): id of user, or None for current user
+
+    Returns:
+        (list of int): gids of groups the user is a member of
+    """
+    if uid is None:
+        uid = os.getuid()
+    user = pwd.getpwuid(uid).pw_name
+    return [g.gr_gid for g in grp.getgrall() if user in g.gr_mem]
+
+
 def copy_mode(src, dest):
+    """Set the mode of dest to that of src unless it is a link.
+    """
+    if os.path.islink(dest):
+        return
     src_mode = os.stat(src).st_mode
     dest_mode = os.stat(dest).st_mode
     if src_mode & stat.S_IXUSR:
@@ -247,11 +293,26 @@ def is_exe(path):
     return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+def get_filetype(path_name):
+    """
+    Return the output of file path_name as a string to identify file type.
+    """
+    file = Executable('file')
+    file.add_default_env('LC_ALL', 'C')
+    output = file('-b', '-h', '%s' % path_name,
+                  output=str, error=str)
+    return output.strip()
+
+
 def mkdirp(*paths):
     """Creates a directory, as well as parent directories if needed."""
     for path in paths:
         if not os.path.exists(path):
-            os.makedirs(path)
+            try:
+                os.makedirs(path)
+            except OSError as e:
+                if e.errno != errno.EEXIST or not os.path.isdir(path):
+                    raise e
         elif not os.path.isdir(path):
             raise OSError(errno.EEXIST, "File already exists", path)
 
@@ -278,6 +339,60 @@ def working_dir(dirname, **kwargs):
 
 
 @contextmanager
+def replace_directory_transaction(directory_name, tmp_root=None):
+    """Moves a directory to a temporary space. If the operations executed
+    within the context manager don't raise an exception, the directory is
+    deleted. If there is an exception, the move is undone.
+
+    Args:
+        directory_name (path): absolute path of the directory name
+        tmp_root (path): absolute path of the parent directory where to create
+            the temporary
+
+    Returns:
+        temporary directory where ``directory_name`` has been moved
+    """
+    # Check the input is indeed a directory with absolute path.
+    # Raise before anything is done to avoid moving the wrong directory
+    assert os.path.isdir(directory_name), \
+        '"directory_name" must be a valid directory'
+    assert os.path.isabs(directory_name), \
+        '"directory_name" must contain an absolute path'
+
+    directory_basename = os.path.basename(directory_name)
+
+    if tmp_root is not None:
+        assert os.path.isabs(tmp_root)
+
+    tmp_dir = tempfile.mkdtemp(dir=tmp_root)
+    tty.debug('TEMPORARY DIRECTORY CREATED [{0}]'.format(tmp_dir))
+
+    shutil.move(src=directory_name, dst=tmp_dir)
+    tty.debug('DIRECTORY MOVED [src={0}, dest={1}]'.format(
+        directory_name, tmp_dir
+    ))
+
+    try:
+        yield tmp_dir
+    except (Exception, KeyboardInterrupt, SystemExit):
+        # Delete what was there, before copying back the original content
+        if os.path.exists(directory_name):
+            shutil.rmtree(directory_name)
+        shutil.move(
+            src=os.path.join(tmp_dir, directory_basename),
+            dst=os.path.dirname(directory_name)
+        )
+        tty.debug('DIRECTORY RECOVERED [{0}]'.format(directory_name))
+
+        msg = 'the transactional move of "{0}" failed.'
+        raise RuntimeError(msg.format(directory_name))
+    else:
+        # Otherwise delete the temporary directory
+        shutil.rmtree(tmp_dir)
+        tty.debug('TEMPORARY DIRECTORY DELETED [{0}]'.format(tmp_dir))
+
+
+@contextmanager
 def hide_files(*file_list):
     try:
         baks = ['%s.bak' % f for f in file_list]
@@ -289,10 +404,42 @@ def hide_files(*file_list):
             shutil.move(bak, f)
 
 
+def hash_directory(directory):
+    """Hashes recursively the content of a directory.
+
+    Args:
+        directory (path): path to a directory to be hashed
+
+    Returns:
+        hash of the directory content
+    """
+    assert os.path.isdir(directory), '"directory" must be a directory!'
+
+    md5_hash = hashlib.md5()
+
+    # Adapted from https://stackoverflow.com/a/3431835/771663
+    for root, dirs, files in os.walk(directory):
+        for name in sorted(files):
+            filename = os.path.join(root, name)
+            # TODO: if caching big files becomes an issue, convert this to
+            # TODO: read in chunks. Currently it's used only for testing
+            # TODO: purposes.
+            with open(filename, 'rb') as f:
+                md5_hash.update(f.read())
+
+    return md5_hash.hexdigest()
+
+
 def touch(path):
     """Creates an empty file at the specified path."""
-    with open(path, 'a'):
+    perms = (os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | os.O_NOCTTY)
+    fd = None
+    try:
+        fd = os.open(path, perms)
         os.utime(path, None)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def touchp(path):
@@ -476,12 +623,10 @@ def fix_darwin_install_name(path):
     libs = glob.glob(join_path(path, "*.dylib"))
     for lib in libs:
         # fix install name first:
-        subprocess.Popen(
-            ["install_name_tool", "-id", lib, lib],
-            stdout=subprocess.PIPE).communicate()[0]
-        long_deps = subprocess.Popen(
-            ["otool", "-L", lib],
-            stdout=subprocess.PIPE).communicate()[0].split('\n')
+        install_name_tool = Executable('install_name_tool')
+        install_name_tool('-id', lib, lib)
+        otool = Executable('otool')
+        long_deps = otool('-L', lib, output=str).split('\n')
         deps = [dep.partition(' ')[0][1::] for dep in long_deps[2:-1]]
         # fix all dependencies:
         for dep in deps:
@@ -492,13 +637,11 @@ def fix_darwin_install_name(path):
                 # but we don't know builddir (nor how symbolic links look
                 # in builddir). We thus only compare the basenames.
                 if os.path.basename(dep) == os.path.basename(loc):
-                    subprocess.Popen(
-                        ["install_name_tool", "-change", dep, loc, lib],
-                        stdout=subprocess.PIPE).communicate()[0]
+                    install_name_tool('-change', dep, loc, lib)
                     break
 
 
-def find(root, files, recurse=True):
+def find(root, files, recursive=True):
     """Search for ``files`` starting from the ``root`` directory.
 
     Like GNU/BSD find but written entirely in Python.
@@ -519,7 +662,7 @@ def find(root, files, recurse=True):
 
     is equivalent to:
 
-    >>> find('/usr/local/bin', 'python', recurse=False)
+    >>> find('/usr/local/bin', 'python', recursive=False)
 
     Accepts any glob characters accepted by fnmatch:
 
@@ -539,38 +682,59 @@ def find(root, files, recurse=True):
             if True descends top-down from the root. Defaults to True.
 
     Returns:
-        :func:`list`: The files that have been found
+        list of strings: The files that have been found
     """
     if isinstance(files, six.string_types):
         files = [files]
 
-    if recurse:
+    if recursive:
         return _find_recursive(root, files)
     else:
         return _find_non_recursive(root, files)
 
 
 def _find_recursive(root, search_files):
-    found_files = []
+
+    # The variable here is **on purpose** a defaultdict. The idea is that
+    # we want to poke the filesystem as little as possible, but still maintain
+    # stability in the order of the answer. Thus we are recording each library
+    # found in a key, and reconstructing the stable order later.
+    found_files = collections.defaultdict(list)
+
+    # Make the path absolute to have os.walk also return an absolute path
+    root = os.path.abspath(root)
 
     for path, _, list_files in os.walk(root):
         for search_file in search_files:
-            for list_file in list_files:
-                if fnmatch.fnmatch(list_file, search_file):
-                    found_files.append(join_path(path, list_file))
+            matches = glob.glob(os.path.join(path, search_file))
+            matches = [os.path.join(path, x) for x in matches]
+            found_files[search_file].extend(matches)
 
-    return found_files
+    answer = []
+    for search_file in search_files:
+        answer.extend(found_files[search_file])
+
+    return answer
 
 
 def _find_non_recursive(root, search_files):
-    found_files = []
+    # The variable here is **on purpose** a defaultdict as os.list_dir
+    # can return files in any order (does not preserve stability)
+    found_files = collections.defaultdict(list)
 
-    for list_file in os.listdir(root):
-        for search_file in search_files:
-            if fnmatch.fnmatch(list_file, search_file):
-                found_files.append(join_path(root, list_file))
+    # Make the path absolute to have absolute path returned
+    root = os.path.abspath(root)
 
-    return found_files
+    for search_file in search_files:
+        matches = glob.glob(os.path.join(root, search_file))
+        matches = [os.path.join(root, x) for x in matches]
+        found_files[search_file].extend(matches)
+
+    answer = []
+    for search_file in search_files:
+        answer.extend(found_files[search_file])
+
+    return answer
 
 
 # Utilities for libraries and headers
@@ -593,9 +757,14 @@ class FileList(collections.Sequence):
         """Stable de-duplication of the directories where the files reside.
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir1/libc.a'])
-        >>> assert l.directories == ['/dir1', '/dir2']
+        >>> l.directories
+        ['/dir1', '/dir2']
         >>> h = HeaderList(['/dir1/a.h', '/dir1/b.h', '/dir2/c.h'])
-        >>> assert h.directories == ['/dir1', '/dir2']
+        >>> h.directories
+        ['/dir1', '/dir2']
+
+        Returns:
+            list of strings: A list of directories
         """
         return list(dedupe(
             os.path.dirname(x) for x in self.files if os.path.dirname(x)
@@ -606,20 +775,16 @@ class FileList(collections.Sequence):
         """Stable de-duplication of the base-names in the list
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir3/liba.a'])
-        >>> assert l.basenames == ['liba.a', 'libb.a']
+        >>> l.basenames
+        ['liba.a', 'libb.a']
         >>> h = HeaderList(['/dir1/a.h', '/dir2/b.h', '/dir3/a.h'])
-        >>> assert h.basenames == ['a.h', 'b.h']
+        >>> h.basenames
+        ['a.h', 'b.h']
+
+        Returns:
+            list of strings: A list of base-names
         """
         return list(dedupe(os.path.basename(x) for x in self.files))
-
-    @property
-    def names(self):
-        """Stable de-duplication of file names in the list
-
-        >>> h = HeaderList(['/dir1/a.h', '/dir2/b.h', '/dir3/a.h'])
-        >>> assert h.names == ['a', 'b']
-        """
-        return list(dedupe(x.split('.')[0] for x in self.basenames))
 
     def __getitem__(self, item):
         cls = type(self)
@@ -663,14 +828,51 @@ class HeaderList(FileList):
 
     @property
     def headers(self):
+        """Stable de-duplication of the headers.
+
+        Returns:
+            list of strings: A list of header files
+        """
         return self.files
+
+    @property
+    def names(self):
+        """Stable de-duplication of header names in the list without extensions
+
+        >>> h = HeaderList(['/dir1/a.h', '/dir2/b.h', '/dir3/a.h'])
+        >>> h.names
+        ['a', 'b']
+
+        Returns:
+            list of strings: A list of files without extensions
+        """
+        names = []
+
+        for x in self.basenames:
+            name = x
+
+            # Valid extensions include: ['.cuh', '.hpp', '.hh', '.h']
+            for ext in ['.cuh', '.hpp', '.hh', '.h']:
+                i = name.rfind(ext)
+                if i != -1:
+                    names.append(name[:i])
+                    break
+            else:
+                # No valid extension, should we still include it?
+                names.append(name)
+
+        return list(dedupe(names))
 
     @property
     def include_flags(self):
         """Include flags
 
         >>> h = HeaderList(['/dir1/a.h', '/dir1/b.h', '/dir2/c.h'])
-        >>> assert h.cpp_flags == '-I/dir1 -I/dir2'
+        >>> h.include_flags
+        '-I/dir1 -I/dir2'
+
+        Returns:
+            str: A joined list of include flags
         """
         return ' '.join(['-I' + x for x in self.directories])
 
@@ -681,7 +883,11 @@ class HeaderList(FileList):
         >>> h = HeaderList(['/dir1/a.h', '/dir1/b.h', '/dir2/c.h'])
         >>> h.add_macro('-DBOOST_LIB_NAME=boost_regex')
         >>> h.add_macro('-DBOOST_DYN_LINK')
-        >>> assert h.macro_definitions == '-DBOOST_LIB_NAME=boost_regex -DBOOST_DYN_LINK'  # noqa
+        >>> h.macro_definitions
+        '-DBOOST_LIB_NAME=boost_regex -DBOOST_DYN_LINK'
+
+        Returns:
+            str: A joined list of macro definitions
         """
         return ' '.join(self._macro_definitions)
 
@@ -690,17 +896,30 @@ class HeaderList(FileList):
         """Include flags + macro definitions
 
         >>> h = HeaderList(['/dir1/a.h', '/dir1/b.h', '/dir2/c.h'])
+        >>> h.cpp_flags
+        '-I/dir1 -I/dir2'
         >>> h.add_macro('-DBOOST_DYN_LINK')
-        >>> assert h.macro_definitions == '-I/dir1 -I/dir2 -DBOOST_DYN_LINK'
+        >>> h.cpp_flags
+        '-I/dir1 -I/dir2 -DBOOST_DYN_LINK'
+
+        Returns:
+            str: A joined list of include flags and macro definitions
         """
-        return self.include_flags + ' ' + self.macro_definitions
+        cpp_flags = self.include_flags
+        if self.macro_definitions:
+            cpp_flags += ' ' + self.macro_definitions
+        return cpp_flags
 
     def add_macro(self, macro):
-        """Add a macro definition"""
+        """Add a macro definition
+
+        Parameters:
+            macro (str): The macro to add
+        """
         self._macro_definitions.append(macro)
 
 
-def find_headers(headers, root, recurse=False):
+def find_headers(headers, root, recursive=False):
     """Returns an iterable object containing a list of full paths to
     headers if found.
 
@@ -718,7 +937,7 @@ def find_headers(headers, root, recurse=False):
     Parameters:
         headers (str or list of str): Header name(s) to search for
         root (str): The root directory to start searching from
-        recurses (bool, optional): if False search only root folder,
+        recursive (bool, optional): if False search only root folder,
             if True descends top-down from the root. Defaults to False.
 
     Returns:
@@ -738,7 +957,7 @@ def find_headers(headers, root, recurse=False):
     # List of headers we are searching with suffixes
     headers = ['{0}.{1}'.format(header, suffix) for header in headers]
 
-    return HeaderList(find(root, headers, recurse))
+    return HeaderList(find(root, headers, recursive))
 
 
 class LibraryList(FileList):
@@ -750,6 +969,11 @@ class LibraryList(FileList):
 
     @property
     def libraries(self):
+        """Stable de-duplication of library files.
+
+        Returns:
+            list of strings: A list of library files
+        """
         return self.files
 
     @property
@@ -757,16 +981,41 @@ class LibraryList(FileList):
         """Stable de-duplication of library names in the list
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir3/liba.so'])
-        >>> assert l.names == ['a', 'b']
+        >>> l.names
+        ['a', 'b']
+
+        Returns:
+            list of strings: A list of library names
         """
-        return list(dedupe(x.split('.')[0][3:] for x in self.basenames))
+        names = []
+
+        for x in self.basenames:
+            name = x
+            if x.startswith('lib'):
+                name = x[3:]
+
+            # Valid extensions include: ['.dylib', '.so', '.a']
+            for ext in ['.dylib', '.so', '.a']:
+                i = name.rfind(ext)
+                if i != -1:
+                    names.append(name[:i])
+                    break
+            else:
+                # No valid extension, should we still include it?
+                names.append(name)
+
+        return list(dedupe(names))
 
     @property
     def search_flags(self):
         """Search flags for the libraries
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir1/liba.so'])
-        >>> assert l.search_flags == '-L/dir1 -L/dir2'
+        >>> l.search_flags
+        '-L/dir1 -L/dir2'
+
+        Returns:
+            str: A joined list of search flags
         """
         return ' '.join(['-L' + x for x in self.directories])
 
@@ -775,7 +1024,11 @@ class LibraryList(FileList):
         """Link flags for the libraries
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir1/liba.so'])
-        >>> assert l.search_flags == '-la -lb'
+        >>> l.link_flags
+        '-la -lb'
+
+        Returns:
+            str: A joined list of link flags
         """
         return ' '.join(['-l' + name for name in self.names])
 
@@ -784,7 +1037,11 @@ class LibraryList(FileList):
         """Search flags + link flags
 
         >>> l = LibraryList(['/dir1/liba.a', '/dir2/libb.a', '/dir1/liba.so'])
-        >>> assert l.search_flags == '-L/dir1 -L/dir2 -la -lb'
+        >>> l.ld_flags
+        '-L/dir1 -L/dir2 -la -lb'
+
+        Returns:
+            str: A joined list of search flags and link flags
         """
         return self.search_flags + ' ' + self.link_flags
 
@@ -841,7 +1098,7 @@ def find_system_libraries(libraries, shared=True):
 
     for library in libraries:
         for root in search_locations:
-            result = find_libraries(library, root, shared, recurse=True)
+            result = find_libraries(library, root, shared, recursive=True)
             if result:
                 libraries_found += result
                 break
@@ -849,7 +1106,7 @@ def find_system_libraries(libraries, shared=True):
     return libraries_found
 
 
-def find_libraries(libraries, root, shared=True, recurse=False):
+def find_libraries(libraries, root, shared=True, recursive=False):
     """Returns an iterable of full paths to libraries found in a root dir.
 
     Accepts any glob characters accepted by fnmatch:
@@ -868,7 +1125,7 @@ def find_libraries(libraries, root, shared=True, recurse=False):
         root (str): The root directory to start searching from
         shared (bool, optional): if True searches for shared libraries,
             otherwise for static. Defaults to True.
-        recurse (bool, optional): if False search only root folder,
+        recursive (bool, optional): if False search only root folder,
             if True descends top-down from the root. Defaults to False.
 
     Returns:
@@ -890,4 +1147,4 @@ def find_libraries(libraries, root, shared=True, recurse=False):
     # List of libraries we are searching with suffixes
     libraries = ['{0}.{1}'.format(lib, suffix) for lib in libraries]
 
-    return LibraryList(find(root, libraries, recurse))
+    return LibraryList(find(root, libraries, recursive))

@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -36,6 +36,9 @@ class M4(AutotoolsPackage):
 
     patch('gnulib-pgi.patch', when='@1.4.18')
     patch('pgi.patch', when='@1.4.17')
+    # from: https://github.com/Homebrew/homebrew-core/blob/master/Formula/m4.rb
+    # Patch credit to Jeremy Huddleston Sequoia <jeremyhu@apple.com>
+    patch('secure_snprintf.patch', when='platform_os = highsierra')
 
     variant('sigsegv', default=True,
             description="Build the libsigsegv dependency")
@@ -47,6 +50,12 @@ class M4(AutotoolsPackage):
     def configure_args(self):
         spec = self.spec
         args = ['--enable-c++']
+
+        if spec.satisfies('%clang') and not spec.satisfies('platform=darwin'):
+            args.append('CFLAGS=-rtlib=compiler-rt')
+
+        if spec.satisfies('%intel'):
+            args.append('CFLAGS=-no-gcc')
 
         if '+sigsegv' in spec:
             args.append('--with-libsigsegv-prefix={0}'.format(

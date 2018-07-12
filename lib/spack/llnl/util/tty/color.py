@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -80,6 +80,7 @@ To output an @, use '@@'.  To output a } inside braces, use '}}'.
 """
 import re
 import sys
+from contextlib import contextmanager
 
 
 class ColorParseError(Exception):
@@ -107,15 +108,62 @@ colors = {'k': 30, 'K': 90,  # black
 # Regex to be used for color formatting
 color_re = r'@(?:@|\.|([*_])?([a-zA-Z])?(?:{((?:[^}]|}})*)})?)'
 
+# Mapping from color arguments to values for tty.set_color
+color_when_values = {
+    'always': True,
+    'auto': None,
+    'never': False
+}
 
-# Force color even if stdout is not a tty.
-_force_color = False
+# Force color; None: Only color if stdout is a tty
+# True: Always colorize output, False: Never colorize output
+_force_color = None
+
+
+def _color_when_value(when):
+    """Raise a ValueError for an invalid color setting.
+
+    Valid values are 'always', 'never', and 'auto', or equivalently,
+    True, False, and None.
+    """
+    if when in color_when_values:
+        return color_when_values[when]
+    elif when not in color_when_values.values():
+        raise ValueError('Invalid color setting: %s' % when)
+    return when
+
+
+def get_color_when():
+    """Return whether commands should print color or not."""
+    if _force_color is not None:
+        return _force_color
+    return sys.stdout.isatty()
+
+
+def set_color_when(when):
+    """Set when color should be applied.  Options are:
+
+    * True or 'always': always print color
+    * False or 'never': never print color
+    * None or 'auto': only print color if sys.stdout is a tty.
+    """
+    global _force_color
+    _force_color = _color_when_value(when)
+
+
+@contextmanager
+def color_when(value):
+    """Context manager to temporarily use a particular color setting."""
+    old_value = value
+    set_color_when(value)
+    yield
+    set_color_when(old_value)
 
 
 class match_to_ansi(object):
 
     def __init__(self, color=True):
-        self.color = color
+        self.color = _color_when_value(color)
 
     def escape(self, s):
         """Returns a TTY escape sequence for a color"""
@@ -142,7 +190,7 @@ class match_to_ansi(object):
         string = styles[style]
         if color:
             if color not in colors:
-                raise ColorParseError("invalid color specifier: '%s' in '%s'"
+                raise ColorParseError("Invalid color specifier: '%s' in '%s'"
                                       % (color, match.string))
             string += ';' + str(colors[color])
 
@@ -166,8 +214,10 @@ def colorize(string, **kwargs):
         color (bool): If False, output will be plain text without control
             codes, for output to non-console devices.
     """
-    color = kwargs.get('color', True)
-    return re.sub(color_re, match_to_ansi(color), string)
+    color = _color_when_value(kwargs.get('color', get_color_when()))
+    string = re.sub(color_re, match_to_ansi(color), string)
+    string = string.replace('}}', '}')
+    return string
 
 
 def clen(string):
@@ -176,19 +226,19 @@ def clen(string):
 
 
 def cextra(string):
-    """"Length of extra color characters in a string"""
+    """Length of extra color characters in a string"""
     return len(''.join(re.findall(r'\033[^m]*m', string)))
 
 
 def cwrite(string, stream=sys.stdout, color=None):
     """Replace all color expressions in string with ANSI control
        codes and write the result to the stream.  If color is
-       False, this will write plain text with o color.  If True,
+       False, this will write plain text with no color.  If True,
        then it will always write colored output.  If not supplied,
        then it will be set based on stream.isatty().
     """
     if color is None:
-        color = stream.isatty() or _force_color
+        color = get_color_when()
     stream.write(colorize(string, color=color))
 
 
@@ -198,8 +248,25 @@ def cprint(string, stream=sys.stdout, color=None):
 
 
 def cescape(string):
-    """Replace all @ with @@ in the string provided."""
-    return str(string).replace('@', '@@')
+    """Escapes special characters needed for color codes.
+
+    Replaces the following symbols with their equivalent literal forms:
+
+    =====  ======
+    ``@``  ``@@``
+    ``}``  ``}}``
+    =====  ======
+
+    Parameters:
+        string (str): the string to escape
+
+    Returns:
+        (str): the string with color codes escaped
+    """
+    string = str(string)
+    string = string.replace('@', '@@')
+    string = string.replace('}', '}}')
+    return string
 
 
 class ColorStream(object):
@@ -217,7 +284,7 @@ class ColorStream(object):
             if raw:
                 color = True
             else:
-                color = self._stream.isatty() or _force_color
+                color = get_color_when()
         raw_write(colorize(string, color=color))
 
     def writelines(self, sequence, **kwargs):

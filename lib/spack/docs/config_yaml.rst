@@ -14,27 +14,6 @@ see the default settings by looking at
 These settings can be overridden in ``etc/spack/config.yaml`` or
 ``~/.spack/config.yaml``.  See :ref:`configuration-scopes` for details.
 
-.. _config-file-variables:
-
-------------------------------
-Config file variables
-------------------------------
-
-You may notice some variables prefixed with ``$`` in the settings above.
-Spack understands several variables that can be used in values of
-configuration parameters.  They are:
-
-  * ``$spack``: path to the prefix of this spack installation
-  * ``$tempdir``: default system temporary directory (as specified in
-    Python's `tempfile.tempdir
-    <https://docs.python.org/2/library/tempfile.html#tempfile.tempdir>`_
-    variable.
-  * ``$user``: name of the current user
-
-Note that, as with shell variables, you can write these as ``$varname``
-or with braces to distinguish the variable from surrounding characters:
-``${varname}``.
-
 --------------------
 ``install_tree``
 --------------------
@@ -126,8 +105,8 @@ When Spack builds a package, it creates a temporary directory within the
 
 After a package is successfully installed, Spack deletes the temporary
 directory it used to build.  Unsuccessful builds are not deleted, but you
-can manually purge them with :ref:`spack purge --stage
-<cmd-spack-purge>`.
+can manually purge them with :ref:`spack clean --stage
+<cmd-spack-clean>`.
 
 .. note::
 
@@ -142,8 +121,8 @@ can manually purge them with :ref:`spack purge --stage
 
 Location to cache downloaded tarballs and repositories.  By default these
 are stored in ``$spack/var/spack/cache``.  These are stored indefinitely
-by default. Can be purged with :ref:`spack purge --downloads
-<cmd-spack-purge>`.
+by default. Can be purged with :ref:`spack clean --downloads
+<cmd-spack-clean>`.
 
 --------------------
 ``misc_cache``
@@ -151,7 +130,7 @@ by default. Can be purged with :ref:`spack purge --downloads
 
 Temporary directory to store long-lived cache files, such as indices of
 packages available in repositories.  Defaults to ``~/.spack/cache``.  Can
-be purged with :ref:`spack purge --misc-cache <cmd-spack-purge>`.
+be purged with :ref:`spack clean --misc-cache <cmd-spack-clean>`.
 
 --------------------
 ``verify_ssl``
@@ -170,6 +149,17 @@ When set to ``true``, Spack verifies downloaded source code using a
 checksum, and will refuse to build packages that it cannot verify.  Set
 to ``false`` to disable these checks.  Disabling this can expose you to
 attacks.  Use at your own risk.
+
+--------------------
+``locks``
+--------------------
+
+When set to ``true``, concurrent instances of Spack will use locks to
+avoid modifying the install tree, database file, etc. If false, Spack
+will disable all locking, but you must **not** run concurrent instances
+of Spack.  For filesystems that don't support locking, you should set
+this to ``false`` and run one Spack at a time, but otherwise we recommend
+enabling locks.
 
 --------------------
 ``dirty``
@@ -201,3 +191,22 @@ to 4, for example, commands like ``spack install`` will run ``make -j4``
 instead of hogging every core.
 
 To build all software in serial, set ``build_jobs`` to 1.
+
+--------------------
+``ccache``
+--------------------
+
+When set to ``true`` Spack will use ccache to cache compiles. This is
+useful specifically un two cases: (1) Use with ``spack setup``, (2)
+Build the same package with many different variants. The default is
+``false``.
+
+When enabled Spack will look inside your ``PATH`` for a ``ccache``
+executable and stop if it is not found. Some systems come with
+``ccache``, but it can also be installed using ``spack install
+ccache``. ``ccache`` comes with reasonable defaults for cache size
+and location. (See the *Configuration settings* secion of ``man
+ccache`` to learn more about the default settings and how change
+them.) Please note that we currently disable ccache's ``hash_dir``
+feature to avoid an issue with the stage directory (see
+https://github.com/LLNL/spack/pull/3761#issuecomment-294352232 ).

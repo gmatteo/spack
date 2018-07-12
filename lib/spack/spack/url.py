@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -50,7 +50,7 @@ from six import StringIO
 from six.moves.urllib.parse import urlsplit, urlunsplit
 
 import llnl.util.tty as tty
-from llnl.util.tty.color import *
+from llnl.util.tty.color import colorize
 
 import spack.error
 import spack.util.compression as comp
@@ -63,16 +63,54 @@ from spack.version import Version
 # "path" seemed like the most generic term.
 #
 def find_list_url(url):
-    """Finds a good list URL for the supplied URL.  This depends on
-       the site.  By default, just assumes that a good list URL is the
-       dirname of an archive path.  For github URLs, this returns the
-       URL of the project's releases page.
+    """Finds a good list URL for the supplied URL.
+
+    By default, returns the dirname of the archive path.
+
+    Provides special treatment for the following websites, which have a
+    unique list URL different from the dirname of the download URL:
+
+    =========  =======================================================
+    GitHub     https://github.com/<repo>/<name>/releases
+    GitLab     https://gitlab.\*/<repo>/<name>/tags
+    BitBucket  https://bitbucket.org/<repo>/<name>/downloads/?tab=tags
+    CRAN       https://\*.r-project.org/src/contrib/Archive/<name>
+    =========  =======================================================
+
+    Parameters:
+        url (str): The download URL for the package
+
+    Returns:
+        str: The list URL for the package
     """
 
     url_types = [
+        # GitHub
         # e.g. https://github.com/llnl/callpath/archive/v1.0.1.tar.gz
         (r'(.*github\.com/[^/]+/[^/]+)',
-         lambda m: m.group(1) + '/releases')]
+         lambda m: m.group(1) + '/releases'),
+
+        # GitLab API endpoint
+        # e.g. https://gitlab.dkrz.de/api/v4/projects/k202009%2Flibaec/repository/archive.tar.gz?sha=v1.0.2
+        (r'(.*gitlab[^/]+)/api/v4/projects/([^/]+)%2F([^/]+)',
+         lambda m: m.group(1) + '/' + m.group(2) + '/' + m.group(3) + '/tags'),
+
+        # GitLab non-API endpoint
+        # e.g. https://gitlab.dkrz.de/k202009/libaec/uploads/631e85bcf877c2dcaca9b2e6d6526339/libaec-1.0.0.tar.gz
+        (r'(.*gitlab[^/]+/(?!api/v4/projects)[^/]+/[^/]+)',
+         lambda m: m.group(1) + '/tags'),
+
+        # BitBucket
+        # e.g. https://bitbucket.org/eigen/eigen/get/3.3.3.tar.bz2
+        (r'(.*bitbucket.org/[^/]+/[^/]+)',
+         lambda m: m.group(1) + '/downloads/?tab=tags'),
+
+        # CRAN
+        # e.g. https://cran.r-project.org/src/contrib/Rcpp_0.12.9.tar.gz
+        # e.g. https://cloud.r-project.org/src/contrib/rgl_0.98.1.tar.gz
+        (r'(.*\.r-project\.org/src/contrib)/([^_]+)',
+         lambda m: m.group(1) + '/Archive/' + m.group(2)),
+    ]
 
     for pattern, fun in url_types:
         match = re.search(pattern, url)
@@ -144,12 +182,14 @@ def strip_version_suffixes(path):
         '[Uu]niversal',
         'jar',
         'complete',
+        'dynamic',
         'oss',
         'gem',
         'tar',
         'sh',
 
         # Download version
+        'release',
         'stable',
         '[Ff]inal',
         'rel',
@@ -166,7 +206,7 @@ def strip_version_suffixes(path):
         'intel',
         'amd64',
         'x64',
-        'x86_64',
+        'x86[_-]64',
         'x86',
         'i[36]86',
         'ppc64(le)?',
@@ -191,7 +231,7 @@ def strip_version_suffixes(path):
         'intel',
         'amd64',
         'x64',
-        'x86_64',
+        'x86[_-]64',
         'x86',
         'i[36]86',
         'ppc64(le)?',
@@ -255,6 +295,7 @@ def strip_name_suffixes(path, version):
         'install',
         'src',
         '(open)?[Ss]ources?',
+        '[._-]archive',
         '[._-]std',
 
         # Download version
@@ -301,7 +342,8 @@ def split_url_extension(path):
     prefix, ext, suffix = path, '', ''
 
     # Strip off sourceforge download suffix.
-    match = re.search(r'((?:sourceforge\.net|sf\.net)/.*)(/download)$', path)
+    # e.g. https://sourceforge.net/projects/glew/files/glew/2.0.0/glew-2.0.0.tgz/download
+    match = re.search(r'(.*(?:sourceforge\.net|sf\.net)/.*)(/download)$', path)
     if match:
         prefix, suffix = match.groups()
 
@@ -492,6 +534,9 @@ def parse_version_offset(path):
 
         # 9th Pass: Query strings
 
+        # e.g. https://gitlab.cosma.dur.ac.uk/api/v4/projects/swift%2Fswiftsim/repository/archive.tar.gz?sha=v0.3.0
+        (r'\?sha=[a-zA-Z+._-]*v?(\d[\da-zA-Z._-]*)$', suffix),
+
         # e.g. http://gitlab.cosma.dur.ac.uk/swift/swiftsim/repository/archive.tar.gz?ref=v0.3.0
         (r'\?ref=[a-zA-Z+._-]*v?(\d[\da-zA-Z._-]*)$', suffix),
 
@@ -603,9 +648,13 @@ def parse_name_offset(path, v=None):
         # e.g. https://github.com/nco/nco/archive/4.6.2.tar.gz
         (r'github\.com/[^/]+/([^/]+)', path),
 
-        # GitLab: gitlab.*/repo/name/
+        # GitLab API endpoint: gitlab.*/api/v4/projects/NAMESPACE%2Fname/
+        # e.g. https://gitlab.cosma.dur.ac.uk/api/v4/projects/swift%2Fswiftsim/repository/archive.tar.gz?sha=v0.3.0
+        (r'gitlab[^/]+/api/v4/projects/[^/]+%2F([^/]+)', path),
+
+        # GitLab non-API endpoint: gitlab.*/repo/name/
         # e.g. http://gitlab.cosma.dur.ac.uk/swift/swiftsim/repository/archive.tar.gz?ref=v0.3.0
-        (r'gitlab[^/]+/[^/]+/([^/]+)', path),
+        (r'gitlab[^/]+/(?!api/v4/projects)[^/]+/([^/]+)', path),
 
         # Bitbucket: bitbucket.org/repo/name/
         # e.g. https://bitbucket.org/glotzer/hoomd-blue/get/v1.3.3.tar.bz2

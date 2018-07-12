@@ -808,17 +808,46 @@ Specifying Specs by Hash
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
 Complicated specs can become cumbersome to enter on the command line,
-especially when many of the qualifications are necessary to
-distinguish between similar installs, for example when using the
-``uninstall`` command. To avoid this, when referencing an existing spec,
+especially when many of the qualifications are necessary to distinguish
+between similar installs. To avoid this, when referencing an existing spec,
 Spack allows you to reference specs by their hash. We previously
 discussed the spec hash that Spack computes. In place of a spec in any
 command, substitute ``/<hash>`` where ``<hash>`` is any amount from
-the beginning of a spec hash. If the given spec hash is sufficient
-to be unique, Spack will replace the reference with the spec to which
-it refers. Otherwise, it will prompt for a more qualified hash.
+the beginning of a spec hash.
 
-Note that this will not work to reinstall a depencency uninstalled by
+For example, lets say that you accidentally installed two different
+``mvapich2`` installations. If you want to uninstall one of them but don't
+know what the difference is, you can run:
+
+.. code-block:: console
+
+   $ spack find --long mvapich2
+   ==> 2 installed packages.
+   -- linux-centos7-x86_64 / gcc@6.3.0 ----------
+   qmt35td mvapich2@2.2%gcc
+   er3die3 mvapich2@2.2%gcc
+
+
+You can then uninstall the latter installation using:
+
+.. code-block:: console
+
+   $ spack uninstall /er3die3
+
+
+Or, if you want to build with a specific installation as a dependency,
+you can use:
+
+.. code-block:: console
+
+   $ spack install trilinos ^/er3die3
+
+
+If the given spec hash is sufficiently long as to be unique, Spack will
+replace the reference with the spec to which it refers. Otherwise, it will
+prompt for a more qualified hash.
+
+Note that this will not work to reinstall a dependency uninstalled by
 ``spack uninstall --force``.
 
 .. _cmd-spack-providers:
@@ -921,11 +950,11 @@ directly when you run ``python``:
    ImportError: No module named numpy
    >>>
 
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Extensions & Environment Modules
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^
+Using Extensions
+^^^^^^^^^^^^^^^^
 
-There are two ways to get ``numpy`` working in Python.  The first is
+There are three ways to get ``numpy`` working in Python.  The first is
 to use :ref:`shell-support`.  You can simply ``use`` or ``load`` the
 module for the extension, and it will be added to the ``PYTHONPATH``
 in your current shell.
@@ -947,15 +976,26 @@ or, for dotkit:
 Now ``import numpy`` will succeed for as long as you keep your current
 session open.
 
-^^^^^^^^^^^^^^^^^^^^^
-Activating Extensions
-^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Activating Extensions in a View
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-It is often desirable to have certain packages *always* available as
-part of a Python installation.  Spack offers a more permanent solution
-for this case.  Instead of requiring users to load particular
-environment modules, you can *activate* the package within the Python
-installation:
+The second way to use extensions is to create a view, which merges the
+python installation along with the extensions into a single prefix.
+See :ref:`filesystem-views` for a more in-depth description of views and
+:ref:`cmd-spack-view` for usage of the ``spack view`` command.
+
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Activating Extensions Globally
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+As an alternative to creating a merged prefix with Python and its extensions,
+and prior to support for views, Spack has provided a means to install the
+extension into the Spack installation prefix for the extendee. This has
+typically been useful since extendable packages typically search their own
+installation path for addons by default.
+
+Global activations are performed with the ``spack activate`` command:
 
 .. _cmd-spack-activate:
 
@@ -1015,11 +1055,11 @@ the ``py-numpy`` into the prefix of the ``python`` package.  To the
 python interpreter, it looks like ``numpy`` is installed in the
 ``site-packages`` directory.
 
-The only limitation of activation is that you can only have a *single*
+The only limitation of global activation is that you can only have a *single*
 version of an extension activated at a time.  This is because multiple
 versions of the same extension would conflict if symbolically linked
 into the same prefix.  Users who want a different version of a package
-can still get it by using environment modules, but they will have to
+can still get it by using environment modules or views, but they will have to
 explicitly load their preferred version.
 
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1064,22 +1104,43 @@ several variants:
 Filesystem requirements
 -----------------------
 
-Spack currently needs to be run from a filesystem that supports
+By default, Spack needs to be run from a filesystem that supports
 ``flock`` locking semantics.  Nearly all local filesystems and recent
-versions of NFS support this, but parallel filesystems may be mounted
-without ``flock`` support enabled.  You can determine how your
-filesystems are mounted with ``mount -p``.  The output for a Lustre
+versions of NFS support this, but parallel filesystems or NFS volumes may
+be configured without ``flock`` support enabled.  You can determine how
+your filesystems are mounted with ``mount``.  The output for a Lustre
 filesystem might look like this:
 
 .. code-block:: console
 
-   $ mount -l | grep lscratch
-   pilsner-mds1-lnet0@o2ib100:/lsd on /p/lscratchd type lustre (rw,nosuid,noauto,_netdev,lazystatfs,flock)
-   porter-mds1-lnet0@o2ib100:/lse on /p/lscratche type lustre (rw,nosuid,noauto,_netdev,lazystatfs,flock)
+   $ mount | grep lscratch
+   mds1-lnet0@o2ib100:/lsd on /p/lscratchd type lustre (rw,nosuid,lazystatfs,flock)
+   mds2-lnet0@o2ib100:/lse on /p/lscratche type lustre (rw,nosuid,lazystatfs,flock)
 
-Note the ``flock`` option on both Lustre mounts.  If you do not see
-this or a similar option for your filesystem, you may need ot ask your
-system administrator to enable ``flock``.
+Note the ``flock`` option on both Lustre mounts.
+
+If you do not see this or a similar option for your filesystem, you have
+a few options. First, you can move your Spack installation to a
+filesystem that supports locking. Second, you could ask your system
+administrator to enable ``flock`` for your filesystem.
+
+If none of those work, you can disable locking in one of two ways:
+
+  1. Run Spack with the ``-L`` or ``--disable-locks`` option to disable
+     locks on a call-by-call basis.
+  2. Edit :ref:`config.yaml <config-yaml>` and set the ``locks`` option
+     to ``false`` to always disable locking.
+
+.. warning::
+
+   If you disable locking, concurrent instances of Spack will have no way
+   to avoid stepping on each other.  You must ensure that there is only
+   **one** instance of Spack running at a time.  Otherwise, Spack may end
+   up with a corrupted database file, or you may not be able to see all
+   installed packages in commands like ``spack find``.
+
+   If you are unfortunate enough to run into this situation, you may be
+   able to fix it by running ``spack reindex``.
 
 This issue typically manifests with the error below:
 

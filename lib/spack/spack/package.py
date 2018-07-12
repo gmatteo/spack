@@ -1,13 +1,13 @@
 ##############################################################################
-# Copyright (c) 2013-2016, Lawrence Livermore National Security, LLC.
+# Copyright (c) 2013-2018, Lawrence Livermore National Security, LLC.
 # Produced at the Lawrence Livermore National Laboratory.
 #
 # This file is part of Spack.
 # Created by Todd Gamblin, tgamblin@llnl.gov, All rights reserved.
 # LLNL-CODE-647188
 #
-# For details, see https://github.com/llnl/spack
-# Please also see the LICENSE file for our notice and the LGPL.
+# For details, see https://github.com/spack/spack
+# Please also see the NOTICE and LICENSE files for our notice and the LGPL.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License (as
@@ -33,12 +33,16 @@ Homebrew makes it very easy to create packages.  For a complete
 rundown on spack and how it differs from homebrew, look at the
 README.
 """
+import base64
 import contextlib
 import copy
 import functools
+import glob
+import hashlib
 import inspect
 import os
 import re
+import shutil
 import sys
 import textwrap
 import time
@@ -47,27 +51,36 @@ from six import string_types
 from six import with_metaclass
 
 import llnl.util.tty as tty
-import spack
+
+import spack.config
+import spack.paths
 import spack.store
 import spack.compilers
 import spack.directives
+import spack.directory_layout
 import spack.error
 import spack.fetch_strategy as fs
 import spack.hooks
 import spack.mirror
-import spack.repository
+import spack.mixins
+import spack.repo
 import spack.url
 import spack.util.web
+import spack.multimethod
+import spack.binary_distribution as binary_distribution
 
-from llnl.util.filesystem import *
-from llnl.util.lang import *
+from llnl.util.filesystem import mkdirp, touch
+from llnl.util.filesystem import working_dir, install_tree, install
+from llnl.util.lang import memoized
 from llnl.util.link_tree import LinkTree
 from llnl.util.tty.log import log_output
-from spack import directory_layout
+from llnl.util.tty.color import colorize
+from spack.filesystem_view import YamlFilesystemView
 from spack.util.executable import which
 from spack.stage import Stage, ResourceStage, StageComposite
 from spack.util.environment import dump_environment
-from spack.version import *
+from spack.util.package_hash import package_hash
+from spack.version import Version
 
 """Allowed URL schemes for spack packages."""
 _ALLOWED_URL_SCHEMES = ["http", "https", "ftp", "file", "git"]
@@ -136,7 +149,10 @@ class InstallPhase(object):
             return other
 
 
-class PackageMeta(spack.directives.DirectiveMetaMixin):
+class PackageMeta(
+    spack.directives.DirectiveMeta,
+    spack.mixins.PackageMixinsMeta
+):
     """Conveniently transforms attributes to permit extensible phases
 
     Iterates over the attribute 'phases' and creates / updates private
@@ -177,6 +193,9 @@ class PackageMeta(spack.directives.DirectiveMetaMixin):
                                 PackageMeta.phase_fmt.format(phase_name),
                                 None
                             )
+                            if phase is not None:
+                                break
+
                         attr_dict[PackageMeta.phase_fmt.format(
                             phase_name)] = phase.copy()
                         phase = attr_dict[
@@ -185,10 +204,9 @@ class PackageMeta(spack.directives.DirectiveMetaMixin):
                 # Clear the attribute for the next class
                 setattr(mcs, attr_name, {})
 
-        # Preconditions
         _flush_callbacks('run_before')
-        # Sanity checks
         _flush_callbacks('run_after')
+
         return super(PackageMeta, mcs).__new__(mcs, name, bases, attr_dict)
 
     @staticmethod
@@ -243,7 +261,54 @@ def on_package_attributes(**attr_dict):
     return _execute_under_condition
 
 
-class PackageBase(with_metaclass(PackageMeta, object)):
+class PackageViewMixin(object):
+    """This collects all functionality related to adding installed Spack
+    package to views. Packages can customize how they are added to views by
+    overriding these functions.
+    """
+    def view_source(self):
+        """The source root directory that will be added to the view: files are
+        added such that their path relative to the view destination matches
+        their path relative to the view source.
+        """
+        return self.spec.prefix
+
+    def view_destination(self, view):
+        """The target root directory: each file is added relative to this
+        directory.
+        """
+        return view.root
+
+    def view_file_conflicts(self, view, merge_map):
+        """Report any files which prevent adding this package to the view. The
+        default implementation looks for any files which already exist.
+        Alternative implementations may allow some of the files to exist in
+        the view (in this case they would be omitted from the results).
+        """
+        return set(dst for dst in merge_map.values() if os.path.exists(dst))
+
+    def add_files_to_view(self, view, merge_map):
+        """Given a map of package files to destination paths in the view, add
+        the files to the view. By default this adds all files. Alternative
+        implementations may skip some files, for example if other packages
+        linked into the view already include the file.
+        """
+        for src, dst in merge_map.items():
+            if not os.path.exists(dst):
+                view.link(src, dst)
+
+    def remove_files_from_view(self, view, merge_map):
+        """Given a map of package files to files currently linked in the view,
+        remove the files from the view. The default implementation removes all
+        files. Alternative implementations may not remove all files. For
+        example if two packages include the same file, it should only be
+        removed when both packages are removed.
+        """
+        for src, dst in merge_map.items():
+            view.remove_file(src, dst)
+
+
+class PackageBase(with_metaclass(PackageMeta, PackageViewMixin, object)):
     """This is the superclass for all spack packages.
 
     ***The Package class***
@@ -255,10 +320,9 @@ class PackageBase(with_metaclass(PackageMeta, object)):
     packages it depends on, so that dependencies can be installed along
     with the package itself.  Packages are written in pure python.
 
-    Packages are all submodules of spack.packages.  If spack is installed
-    in ``$prefix``, all of its python files are in ``$prefix/lib/spack``.
-    Most of them are in the spack module, so all the packages live in
-    ``$prefix/lib/spack/spack/packages``.
+    Packages live in repositories (see repo.py).  If spack is installed
+    in ``$prefix``, all of its built-in package files are in the builtin
+    repo at ``$prefix/var/spack/repos/builtin/packages``.
 
     All you have to do to create a package is make a new subclass of Package
     in this directory.  Spack automatically scans the python files there
@@ -386,7 +450,7 @@ class PackageBase(with_metaclass(PackageMeta, object)):
     the class name (The class name is really only used by spack to find
     your package).
 
-    Spack will download an install each dependency before it installs your
+    Spack will download and install each dependency before it installs your
     package.  In addtion, it will add -L, -I, and rpath arguments to your
     compiler and linker for each dependency.  In most cases, this allows you
     to avoid specifying any dependencies in your configure or cmake line;
@@ -479,41 +543,89 @@ class PackageBase(with_metaclass(PackageMeta, object)):
 
     Package creators override functions like install() (all of them do this),
     clean() (some of them do this), and others to provide custom behavior.
+
     """
     #
     # These are default values for instance variables.
     #
-    """By default we build in parallel.  Subclasses can override this."""
+
+    #: By default we build in parallel.  Subclasses can override this.
     parallel = True
 
-    """# jobs to use for parallel make. If set, overrides default of ncpus."""
-    make_jobs = spack.build_jobs
+    #: # jobs to use for parallel make. If set, overrides default of ncpus.
+    make_jobs = None
 
-    """By default do not run tests within package's install()"""
+    #: By default do not run tests within package's install()
     run_tests = False
 
     # FIXME: this is a bad object-oriented design, should be moved to Clang.
-    """By default do not setup mockup XCode on macOS with Clang"""
+    #: By default do not setup mockup XCode on macOS with Clang
     use_xcode = False
 
-    """Most packages are NOT extendable. Set to True if you want extensions."""
+    #: Most packages are NOT extendable. Set to True if you want extensions.
     extendable = False
 
-    """When True, add RPATHs for the entire DAG. When False, add RPATHs only
-       for immediate dependencies."""
+    #: When True, add RPATHs for the entire DAG. When False, add RPATHs only
+    #: for immediate dependencies.
     transitive_rpaths = True
 
-    """List of prefix-relative file paths (or a single path). If these do
-       not exist after install, or if they exist but are not files,
-       sanity checks fail.
-    """
+    #: List of prefix-relative file paths (or a single path). If these do
+    #: not exist after install, or if they exist but are not files,
+    #: sanity checks fail.
     sanity_check_is_file = []
 
-    """List of prefix-relative directory paths (or a single path). If
-       these do not exist after install, or if they exist but are not
-       directories, sanity checks will fail.
-    """
+    #: List of prefix-relative directory paths (or a single path). If
+    #: these do not exist after install, or if they exist but are not
+    #: directories, sanity checks will fail.
     sanity_check_is_dir = []
+
+    #: List of glob expressions. Each expression must either be
+    #: absolute or relative to the package source path.
+    #: Matching artifacts found at the end of the build process will
+    #: be copied in the same directory tree as build.env and build.out.
+    archive_files = []
+
+    #
+    # Set default licensing information
+    #
+
+    #: Boolean. If set to ``True``, this software requires a license.
+    #: If set to ``False``, all of the ``license_*`` attributes will
+    #: be ignored. Defaults to ``False``.
+    license_required = False
+
+    #: String. Contains the symbol used by the license manager to denote
+    #: a comment. Defaults to ``#``.
+    license_comment = '#'
+
+    #: List of strings. These are files that the software searches for when
+    #: looking for a license. All file paths must be relative to the
+    #: installation directory. More complex packages like Intel may require
+    #: multiple licenses for individual components. Defaults to the empty list.
+    license_files = []
+
+    #: List of strings. Environment variables that can be set to tell the
+    #: software where to look for a license if it is not in the usual location.
+    #: Defaults to the empty list.
+    license_vars = []
+
+    #: String. A URL pointing to license setup instructions for the software.
+    #: Defaults to the empty string.
+    license_url = ''
+
+    #: Verbosity level, preserved across installs.
+    _verbose = None
+
+    #: index of patches by sha256 sum, built lazily
+    _patches_by_hash = None
+
+    #: List of strings which contains GitHub usernames of package maintainers.
+    #: Do not include @ here in order not to unnecessarily ping the users.
+    maintainers = []
+
+    #: List of attributes which affect do not affect a package's content.
+    metadata_attrs = ['homepage', 'url', 'list_url', 'extendable', 'parallel',
+                      'make_jobs']
 
     def __init__(self, spec):
         # this determines how the package should be built.
@@ -568,22 +680,6 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         if not hasattr(self, 'list_depth'):
             self.list_depth = 0
 
-        # Set default licensing information
-        if not hasattr(self, 'license_required'):
-            self.license_required = False
-
-        if not hasattr(self, 'license_comment'):
-            self.license_comment = '#'
-
-        if not hasattr(self, 'license_files'):
-            self.license_files = []
-
-        if not hasattr(self, 'license_vars'):
-            self.license_vars = []
-
-        if not hasattr(self, 'license_url'):
-            self.license_url = None
-
         # Set up some internal variables for timing.
         self._fetch_time = 0.0
         self._total_time = 0.0
@@ -593,31 +689,55 @@ class PackageBase(with_metaclass(PackageMeta, object)):
 
         self.extra_args = {}
 
-    def possible_dependencies(self, visited=None):
-        """Return set of possible transitive dependencies of this package."""
-        if visited is None:
-            visited = set()
+        super(PackageBase, self).__init__()
 
-        visited.add(self.name)
-        for name in self.dependencies:
-            if name not in visited and not spack.spec.Spec(name).virtual:
-                pkg = spack.repo.get(name)
-                for name in pkg.possible_dependencies(visited):
+    def possible_dependencies(
+            self, transitive=True, expand_virtuals=True, visited=None):
+        """Return set of possible dependencies of this package.
+
+        Note: the set returned *includes* the package itself.
+
+        Args:
+            transitive (bool): return all transitive dependencies if True,
+                only direct dependencies if False.
+            expand_virtuals (bool): expand virtual dependencies into all
+                possible implementations.
+            visited (set): set of names of dependencies visited so far.
+        """
+        if visited is None:
+            visited = set([self.name])
+
+        for i, name in enumerate(self.dependencies):
+            if spack.repo.path.is_virtual(name):
+                if expand_virtuals:
+                    providers = spack.repo.path.providers_for(name)
+                    dep_names = [spec.name for spec in providers]
+                else:
                     visited.add(name)
+                    continue
+            else:
+                dep_names = [name]
+
+            for dep_name in dep_names:
+                if dep_name not in visited:
+                    visited.add(dep_name)
+                    if transitive:
+                        pkg = spack.repo.get(dep_name)
+                        pkg.possible_dependencies(
+                            transitive, expand_virtuals, visited)
 
         return visited
 
     @property
     def package_dir(self):
         """Return the directory where the package.py file lives."""
-        return os.path.dirname(self.module.__file__)
+        return os.path.abspath(os.path.dirname(self.module.__file__))
 
     @property
     def global_license_dir(self):
         """Returns the directory where global license files for all
            packages are stored."""
-        spack_root = ancestor(__file__, 4)
-        return join_path(spack_root, 'etc', 'spack', 'licenses')
+        return os.path.join(spack.paths.prefix, 'etc', 'spack', 'licenses')
 
     @property
     def global_license_file(self):
@@ -625,8 +745,8 @@ class PackageBase(with_metaclass(PackageMeta, object)):
            particular package should be stored."""
         if not self.license_files:
             return
-        return join_path(self.global_license_dir, self.name,
-                         os.path.basename(self.license_files[0]))
+        return os.path.join(self.global_license_dir, self.name,
+                            os.path.basename(self.license_files[0]))
 
     @property
     def version(self):
@@ -645,22 +765,6 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             if 'url' in args:
                 version_urls[v] = args['url']
         return version_urls
-
-    def nearest_url(self, version):
-        """Finds the URL for the next lowest version with a URL.
-           If there is no lower version with a URL, uses the
-           package url property. If that isn't there, uses a
-           *higher* URL, and if that isn't there raises an error.
-        """
-        version_urls = self.version_urls()
-        url = getattr(self.__class__, 'url', None)
-
-        for v in version_urls:
-            if v > version and url:
-                break
-            if version_urls[v]:
-                url = version_urls[v]
-        return url
 
     # TODO: move this out of here and into some URL extrapolation module?
     def url_for_version(self, version):
@@ -684,9 +788,10 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         if version in version_urls:
             return version_urls[version]
 
-        # If we have no idea, try to substitute the version.
+        # If we have no idea, substitute the version into the default URL.
+        default_url = getattr(self.__class__, 'url', None)
         return spack.url.substitute_version(
-            self.nearest_url(version), self.url_version(version))
+            default_url, self.url_version(version))
 
     def _make_resource_stage(self, root_stage, fetcher, resource):
         resource_stage_folder = self._resource_stage(resource)
@@ -732,14 +837,16 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             # Append the item to the composite
             composite_stage.append(stage)
 
-        # Create stage on first access.  Needed because fetch, stage,
-        # patch, and install can be called independently of each
-        # other, so `with self.stage:` in do_install isn't sufficient.
-        composite_stage.create()
         return composite_stage
 
     @property
     def stage(self):
+        """Get the build staging area for this package.
+
+        This automatically instantiates a ``Stage`` object if the package
+        doesn't have one yet, but it does not create the Stage directory
+        on the filesystem.
+        """
         if not self.spec.concrete:
             raise ValueError("Can only get a stage for a concrete package.")
         if self._stage is None:
@@ -750,6 +857,20 @@ class PackageBase(with_metaclass(PackageMeta, object)):
     def stage(self, stage):
         """Allow a stage object to be set to override the default."""
         self._stage = stage
+
+    @property
+    def env_path(self):
+        if self.stage.source_path is None:
+            return None
+        else:
+            return os.path.join(self.stage.source_path, 'spack-build.env')
+
+    @property
+    def log_path(self):
+        if self.stage.source_path is None:
+            return None
+        else:
+            return os.path.join(self.stage.source_path, 'spack-build.out')
 
     def _make_fetcher(self):
         # Construct a composite fetcher that always contains at least
@@ -778,9 +899,18 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         self._fetcher = f
 
     def dependencies_of_type(self, *deptypes):
-        """Get subset of the dependencies with certain types."""
-        return dict((name, conds) for name, conds in self.dependencies.items()
-                    if any(d in self.dependency_types[name] for d in deptypes))
+        """Get dependencies that can possibly have these deptypes.
+
+        This analyzes the package and determines which dependencies *can*
+        be a certain kind of dependency. Note that they may not *always*
+        be this kind of dependency, since dependencies can be optional,
+        so something may be a build dependency in one configuration and a
+        run dependency in another.
+        """
+        return dict(
+            (name, conds) for name, conds in self.dependencies.items()
+            if any(dt in self.dependencies[name][cond].type
+                   for cond in conds for dt in deptypes))
 
     @property
     def extendee_spec(self):
@@ -831,24 +961,37 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             return bool(self.extendees)
 
     def extends(self, spec):
+        '''
+        Returns True if this package extends the given spec.
+
+        If ``self.spec`` is concrete, this returns whether this package extends
+        the given spec.
+
+        If ``self.spec`` is not concrete, this returns whether this package may
+        extend the given spec.
+        '''
         if spec.name not in self.extendees:
             return False
         s = self.extendee_spec
-        return s and s.satisfies(spec)
+        return s and spec.satisfies(s)
 
-    @property
-    def activated(self):
+    def is_activated(self, view):
+        """Return True if package is activated."""
         if not self.is_extension:
             raise ValueError(
-                "is_extension called on package that is not an extension.")
-        exts = spack.store.layout.extension_map(self.extendee_spec)
+                "is_activated called on package that is not an extension.")
+        extensions_layout = view.extensions_layout
+        exts = extensions_layout.extension_map(self.extendee_spec)
         return (self.name in exts) and (exts[self.name] == self.spec)
 
     def provides(self, vpkg_name):
         """
         True if this package provides a virtual package with the specified name
         """
-        return any(s.name == vpkg_name for s in self.provided)
+        return any(
+            any(self.spec.satisfies(c) for c in constraints)
+            for s, constraints in self.provided.items() if s.name == vpkg_name
+        )
 
     @property
     def installed(self):
@@ -902,9 +1045,10 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             raise ValueError("Can only fetch concrete packages.")
 
         start_time = time.time()
-        if spack.do_checksum and self.version not in self.versions:
+        checksum = spack.config.get('config:checksum')
+        if checksum and self.version not in self.versions:
             tty.warn("There is no checksum on file to fetch %s safely." %
-                     self.spec.format('$_$@'))
+                     self.spec.cformat('$_$@'))
 
             # Ask the user whether to skip the checksum if we're
             # interactive, but just fail if non-interactive.
@@ -920,60 +1064,91 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 raise FetchError("Will not fetch %s" %
                                  self.spec.format('$_$@'), ck_msg)
 
+        self.stage.create()
         self.stage.fetch(mirror_only)
-
         self._fetch_time = time.time() - start_time
 
-        if spack.do_checksum and self.version in self.versions:
+        if checksum and self.version in self.versions:
             self.stage.check()
 
         self.stage.cache_local()
 
     def do_stage(self, mirror_only=False):
-        """Unpacks the fetched tarball, then changes into the expanded tarball
-           directory."""
+        """Unpacks and expands the fetched tarball."""
         if not self.spec.concrete:
             raise ValueError("Can only stage concrete packages.")
 
-        self.do_fetch(mirror_only)
+        self.do_fetch(mirror_only)     # this will create the stage
         self.stage.expand_archive()
-        self.stage.chdir_to_source()
 
-    def patch(self):
-        """Default patch implementation is a no-op."""
-        pass
+        if not os.listdir(self.stage.path):
+            raise FetchError("Archive was empty for %s" % self.name)
+
+    @classmethod
+    def lookup_patch(cls, sha256):
+        """Look up a patch associated with this package by its sha256 sum.
+
+        Args:
+            sha256 (str): sha256 sum of the patch to look up
+
+        Returns:
+            (Patch): ``Patch`` object with the given hash, or ``None`` if
+                not found.
+
+        To do the lookup, we build an index lazily.  This allows us to
+        avoid computing a sha256 for *every* patch and on every package
+        load.  With lazy hashing, we only compute hashes on lookup, which
+        usually happens at build time.
+
+        """
+        if cls._patches_by_hash is None:
+            cls._patches_by_hash = {}
+
+            # Add patches from the class
+            for cond, patch_list in cls.patches.items():
+                for patch in patch_list:
+                    cls._patches_by_hash[patch.sha256] = patch
+
+            # and patches on dependencies
+            for name, conditions in cls.dependencies.items():
+                for cond, dependency in conditions.items():
+                    for pcond, patch_list in dependency.patches.items():
+                        for patch in patch_list:
+                            cls._patches_by_hash[patch.sha256] = patch
+
+        return cls._patches_by_hash.get(sha256, None)
 
     def do_patch(self):
-        """Calls do_stage(), then applied patches to the expanded tarball if they
-           haven't been applied already."""
+        """Applies patches if they haven't been applied already."""
         if not self.spec.concrete:
             raise ValueError("Can only patch concrete packages.")
 
-        # Kick off the stage first.
+        # Kick off the stage first.  This creates the stage.
         self.do_stage()
 
         # Package can add its own patch function.
         has_patch_fun = hasattr(self, 'patch') and callable(self.patch)
 
+        # Get the patches from the spec (this is a shortcut for the MV-variant)
+        patches = self.spec.patches
+
         # If there are no patches, note it.
-        if not self.patches and not has_patch_fun:
+        if not patches and not has_patch_fun:
             tty.msg("No patches needed for %s" % self.name)
             return
 
         # Construct paths to special files in the archive dir used to
         # keep track of whether patches were successfully applied.
         archive_dir = self.stage.source_path
-        good_file = join_path(archive_dir, '.spack_patched')
-        no_patches_file = join_path(archive_dir, '.spack_no_patches')
-        bad_file = join_path(archive_dir, '.spack_patch_failed')
+        good_file = os.path.join(archive_dir, '.spack_patched')
+        no_patches_file = os.path.join(archive_dir, '.spack_no_patches')
+        bad_file = os.path.join(archive_dir, '.spack_patch_failed')
 
         # If we encounter an archive that failed to patch, restage it
         # so that we can apply all the patches again.
         if os.path.isfile(bad_file):
             tty.msg("Patching failed last time. Restaging.")
             self.stage.restage()
-
-        self.stage.chdir_to_source()
 
         # If this file exists, then we already applied all the patches.
         if os.path.isfile(good_file):
@@ -985,25 +1160,34 @@ class PackageBase(with_metaclass(PackageMeta, object)):
 
         # Apply all the patches for specs that match this one
         patched = False
-        for spec, patch_list in self.patches.items():
-            if self.spec.satisfies(spec):
-                for patch in patch_list:
-                    try:
-                        patch.apply(self.stage)
-                        tty.msg('Applied patch %s' % patch.path_or_url)
-                        patched = True
-                    except:
-                        # Touch bad file if anything goes wrong.
-                        tty.msg('Patch %s failed.' % patch.path_or_url)
-                        touch(bad_file)
-                        raise
+        for patch in patches:
+            try:
+                with working_dir(self.stage.source_path):
+                    patch.apply(self.stage)
+                tty.msg('Applied patch %s' % patch.path_or_url)
+                patched = True
+            except spack.error.SpackError:
+                # Touch bad file if anything goes wrong.
+                tty.msg('Patch %s failed.' % patch.path_or_url)
+                touch(bad_file)
+                raise
 
         if has_patch_fun:
             try:
-                self.patch()
+                with working_dir(self.stage.source_path):
+                    self.patch()
                 tty.msg("Ran patch() for %s" % self.name)
                 patched = True
-            except:
+            except spack.multimethod.NoSuchMethodError:
+                # We are running a multimethod without a default case.
+                # If there's no default it means we don't need to patch.
+                if not patched:
+                    # if we didn't apply a patch from a patch()
+                    # directive, AND the patch function didn't apply, say
+                    # no patches are needed.  Otherwise, we already
+                    # printed a message for each patch.
+                    tty.msg("No patches needed for %s" % self.name)
+            except spack.error.SpackError:
                 tty.msg("patch() function failed for %s" % self.name)
                 touch(bad_file)
                 raise
@@ -1020,6 +1204,33 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         else:
             touch(no_patches_file)
 
+    def content_hash(self, content=None):
+        """Create a hash based on the sources and logic used to build the
+        package. This includes the contents of all applied patches and the
+        contents of applicable functions in the package subclass."""
+        if not self.spec.concrete:
+            err_msg = ("Cannot invoke content_hash on a package"
+                       " if the associated spec is not concrete")
+            raise spack.error.SpackError(err_msg)
+
+        hashContent = list()
+        source_id = fs.for_package_version(self, self.version).source_id()
+        if not source_id:
+            # TODO? in cases where a digest or source_id isn't available,
+            # should this attempt to download the source and set one? This
+            # probably only happens for source repositories which are
+            # referenced by branch name rather than tag or commit ID.
+            message = 'Missing a source id for {s.name}@{s.version}'
+            tty.warn(message.format(s=self))
+            hashContent.append(''.encode('utf-8'))
+        else:
+            hashContent.append(source_id.encode('utf-8'))
+        hashContent.extend(':'.join((p.sha256, str(p.level))).encode('utf-8')
+                           for p in self.spec.patches)
+        hashContent.append(package_hash(self.spec, content))
+        return base64.b32encode(
+            hashlib.sha256(bytes().join(sorted(hashContent))).digest()).lower()
+
     @property
     def namespace(self):
         namespace, dot, module = self.__module__.rpartition('.')
@@ -1029,23 +1240,33 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         """Make a fake install directory containing fake executables,
         headers, and libraries."""
 
-        name = self.name
-        library_name = 'lib' + self.name
+        command = self.name
+        header = self.name
+        library = self.name
+
+        # Avoid double 'lib' for packages whose names already start with lib
+        if not self.name.startswith('lib'):
+            library = 'lib' + library
+
         dso_suffix = '.dylib' if sys.platform == 'darwin' else '.so'
         chmod = which('chmod')
 
+        # Install fake command
         mkdirp(self.prefix.bin)
-        touch(join_path(self.prefix.bin, name))
-        chmod('+x', join_path(self.prefix.bin, name))
+        touch(os.path.join(self.prefix.bin, command))
+        chmod('+x', os.path.join(self.prefix.bin, command))
 
+        # Install fake header file
         mkdirp(self.prefix.include)
-        touch(join_path(self.prefix.include, name + '.h'))
+        touch(os.path.join(self.prefix.include, header + '.h'))
 
+        # Install fake shared and static libraries
         mkdirp(self.prefix.lib)
-        touch(join_path(self.prefix.lib, library_name + dso_suffix))
-        touch(join_path(self.prefix.lib, library_name + '.a'))
+        for suffix in [dso_suffix, '.a']:
+            touch(os.path.join(self.prefix.lib, library + suffix))
 
-        mkdirp(self.prefix.man1)
+        # Install fake man page
+        mkdirp(self.prefix.man.man1)
 
         packages_dir = spack.store.layout.build_packages_path(self.spec)
         dump_packages(self.spec, packages_dir)
@@ -1065,11 +1286,29 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             matches = [line for line in f.readlines() if regex.match(line)]
 
         if not matches:
-            tty.msg('Target \'' + target + ':\' not found in Makefile')
+            tty.msg("Target '" + target + ":' not found in Makefile")
             return
 
         # Execute target
         inspect.getmodule(self).make(target)
+
+    def _if_ninja_target_execute(self, target):
+        # Check if we have a ninja build script
+        if not os.path.exists('build.ninja'):
+            tty.msg('No ninja build script found in the build directory')
+            return
+
+        # Check if 'target' is in the ninja build script
+        regex = re.compile('^build ' + target + ':')
+        with open('build.ninja', 'r') as f:
+            matches = [line for line in f.readlines() if regex.match(line)]
+
+        if not matches:
+            tty.msg("Target 'build " + target + ":' not found in build.ninja")
+            return
+
+        # Execute target
+        inspect.getmodule(self).ninja(target)
 
     def _get_needed_resources(self):
         resources = []
@@ -1142,16 +1381,33 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 message = '{s.name}@{s.version} : marking the package explicit'
                 tty.msg(message.format(s=self))
 
+    def try_install_from_binary_cache(self, explicit):
+        tty.msg('Searching for binary cache of %s' % self.name)
+        specs = binary_distribution.get_specs()
+        binary_spec = spack.spec.Spec.from_dict(self.spec.to_dict())
+        binary_spec._mark_concrete()
+        if binary_spec not in specs:
+            return False
+        tty.msg('Installing %s from binary cache' % self.name)
+        tarball = binary_distribution.download_tarball(binary_spec)
+        binary_distribution.extract_tarball(
+            binary_spec, tarball, allow_root=False,
+            unsigned=False, force=False)
+        spack.store.db.add(
+            self.spec, spack.store.layout, explicit=explicit)
+        return True
+
     def do_install(self,
                    keep_prefix=False,
                    keep_stage=False,
+                   install_source=False,
                    install_deps=True,
                    skip_patch=False,
                    verbose=False,
                    make_jobs=None,
-                   run_tests=False,
                    fake=False,
                    explicit=False,
+                   tests=False,
                    dirty=None,
                    **kwargs):
         """Called by commands to install a package and its dependencies.
@@ -1165,6 +1421,8 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             keep_stage (bool): By default, stage is destroyed only if there
                 are no exceptions during build. Set to True to keep the stage
                 even with exceptions.
+            install_source (bool): By default, source is not installed, but
+                for debugging it might be useful to keep it around.
             install_deps (bool): Install dependencies before installing this
                 package
             skip_patch (bool): Skip patch stage of build if True.
@@ -1172,10 +1430,11 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 suppresses it)
             make_jobs (int): Number of make jobs to use for install. Default
                 is ncpus
-            run_tests (bool): Run tests within the package's install()
             fake (bool): Don't really build; install fake stub files instead.
             explicit (bool): True if package was explicitly installed, False
                 if package was implicitly installed (as a dependency).
+            tests (bool or list or set): False to run no tests, True to test
+                all packages, or a list of package names to run tests for some
             dirty (bool): Don't clean the build environment before installing.
             force (bool): Install again, even if already installed.
         """
@@ -1188,67 +1447,75 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         if self.spec.external:
             return self._process_external_package(explicit)
 
+        restage = kwargs.get('restage', False)
+        partial = self.check_for_unfinished_installation(keep_prefix, restage)
+
         # Ensure package is not already installed
         layout = spack.store.layout
         with spack.store.db.prefix_read_lock(self.spec):
-            if (keep_prefix and os.path.isdir(self.prefix) and
-                    (not self.installed)):
+            if partial:
                 tty.msg(
                     "Continuing from partial install of %s" % self.name)
             elif layout.check_installed(self.spec):
                 msg = '{0.name} is already installed in {0.prefix}'
                 tty.msg(msg.format(self))
                 rec = spack.store.db.get_record(self.spec)
+                # In case the stage directory has already been created,
+                # this ensures it's removed after we checked that the spec
+                # is installed
+                if keep_stage is False:
+                    self.stage.destroy()
                 return self._update_explicit_entry_in_db(rec, explicit)
-
-        # Dirty argument takes precedence over dirty config setting.
-        if dirty is None:
-            dirty = spack.dirty
 
         self._do_install_pop_kwargs(kwargs)
 
         # First, install dependencies recursively.
         if install_deps:
             tty.debug('Installing {0} dependencies'.format(self.name))
-            for dep in self.spec.dependencies():
+            for dep in self.spec.traverse(order='post', root=False):
                 dep.package.do_install(
+                    install_deps=False,
+                    explicit=False,
                     keep_prefix=keep_prefix,
                     keep_stage=keep_stage,
-                    install_deps=install_deps,
+                    install_source=install_source,
                     fake=fake,
                     skip_patch=skip_patch,
                     verbose=verbose,
                     make_jobs=make_jobs,
-                    run_tests=run_tests,
+                    tests=tests,
                     dirty=dirty,
-                    **kwargs
-                )
+                    **kwargs)
 
-        tty.msg('Installing %s' % self.name)
+        tty.msg(colorize('@*{Installing} @*g{%s}' % self.name))
 
-        # Set run_tests flag before starting build.
-        self.run_tests = run_tests
+        if kwargs.get('use_cache', False):
+            if self.try_install_from_binary_cache(explicit):
+                tty.msg('Successfully installed %s from binary cache'
+                        % self.name)
+                print_pkg(self.prefix)
+                spack.hooks.post_install(self.spec)
+                return
+
+            tty.msg('No binary for %s found: installing from source'
+                    % self.name)
+
+        # Set run_tests flag before starting build
+        self.run_tests = (tests is True or
+                          tests and self.name in tests)
 
         # Set parallelism before starting build.
         self.make_jobs = make_jobs
 
         # Then install the package itself.
-        def build_process(input_stream):
-            """Forked for each build. Has its own process and python
-               module space set up by build_environment.fork()."""
+        def build_process():
+            """This implements the process forked for each build.
 
-            # We are in the child process. This means that our sys.stdin is
-            # equal to open(os.devnull). Python did this to prevent our process
-            # and the parent process from possible simultaneous reading from
-            # the original standard input. But we assume that the parent
-            # process is not going to read from it till we are done here,
-            # otherwise it should not have passed us the copy of the stream.
-            # Thus, we are free to work with the the copy (input_stream)
-            # however we want. For example, we might want to call functions
-            # (e.g. input()) that implicitly read from whatever stream is
-            # assigned to sys.stdin. Since we want them to work with the
-            # original input stream, we are making the following assignment:
-            sys.stdin = input_stream
+            Has its own process and python module space set up by
+            build_environment.fork().
+
+            This function's return value is returned to the parent process.
+            """
 
             start_time = time.time()
             if not fake:
@@ -1261,6 +1528,11 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 'Building {0} [{1}]'.format(self.name, self.build_system_class)
             )
 
+            # get verbosity from do_install() parameter or saved value
+            echo = verbose
+            if PackageBase._verbose is not None:
+                echo = PackageBase._verbose
+
             self.stage.keep = keep_stage
             with self._stage_and_write_lock():
                 # Run the pre-install hook in the child process after
@@ -1269,41 +1541,35 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 if fake:
                     self.do_fake_install()
                 else:
+                    source_path = self.stage.source_path
+                    if install_source and os.path.isdir(source_path):
+                        src_target = os.path.join(
+                            self.spec.prefix, 'share', self.name, 'src')
+                        tty.msg('Copying source to {0}'.format(src_target))
+                        install_tree(self.stage.source_path, src_target)
+
                     # Do the real install in the source directory.
-                    self.stage.chdir_to_source()
+                    with working_dir(self.stage.source_path):
+                        # Save the build environment in a file before building.
+                        dump_environment(self.env_path)
 
-                    # Save the build environment in a file before building.
-                    env_path = join_path(os.getcwd(), 'spack-build.env')
+                        # Spawn a daemon that reads from a pipe and redirects
+                        # everything to log_path
+                        with log_output(self.log_path, echo, True) as logger:
+                            for phase_name, phase_attr in zip(
+                                    self.phases, self._InstallPhase_phases):
 
-                    # Redirect I/O to a build log (and optionally to
-                    # the terminal)
-                    log_path = join_path(os.getcwd(), 'spack-build.out')
+                                with logger.force_echo():
+                                    tty.msg(
+                                        "Executing phase: '%s'" % phase_name)
 
-                    # FIXME : refactor this assignment
-                    self.log_path = log_path
-                    self.env_path = env_path
-                    dump_environment(env_path)
+                                # Redirect stdout and stderr to daemon pipe
+                                phase = getattr(self, phase_attr)
+                                phase(self.spec, self.prefix)
 
-                    # Spawn a daemon that reads from a pipe and redirects
-                    # everything to log_path
-                    redirection_context = log_output(
-                        log_path,
-                        echo=verbose,
-                        force_color=sys.stdout.isatty(),
-                        debug=True,
-                        input_stream=input_stream
-                    )
-                    with redirection_context as log_redirection:
-                        for phase_name, phase in zip(
-                                self.phases, self._InstallPhase_phases):
-                            tty.msg(
-                                'Executing phase : \'{0}\''.format(phase_name)
-                            )
-                            # Redirect stdout and stderr to daemon pipe
-                            with log_redirection:
-                                getattr(self, phase)(
-                                    self.spec, self.prefix)
+                    echo = logger.echo
                     self.log()
+
                 # Run post install hooks before build stage is removed.
                 spack.hooks.post_install(self.spec)
 
@@ -1317,11 +1583,24 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                      _hms(self._total_time)))
             print_pkg(self.prefix)
 
+            # preserve verbosity across runs
+            return echo
+
+        # hook that allow tests to inspect this Package before installation
+        # see unit_test_check() docs.
+        if not self.unit_test_check():
+            return
+
         try:
             # Create the install prefix and fork the build process.
-            spack.store.layout.create_install_directory(self.spec)
+            if not os.path.exists(self.prefix):
+                spack.store.layout.create_install_directory(self.spec)
+
             # Fork a child to do the actual installation
-            spack.build_environment.fork(self, build_process, dirty=dirty)
+            # we preserve verbosity settings across installs.
+            PackageBase._verbose = spack.build_environment.fork(
+                self, build_process, dirty=dirty, fake=fake)
+
             # If we installed then we should keep the prefix
             keep_prefix = self.last_phase is None or keep_prefix
             # note: PARENT of the build process adds the new package to
@@ -1329,7 +1608,7 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             spack.store.db.add(
                 self.spec, spack.store.layout, explicit=explicit
             )
-        except directory_layout.InstallDirectoryAlreadyExistsError:
+        except spack.directory_layout.InstallDirectoryAlreadyExistsError:
             # Abort install if install directory exists.
             # But do NOT remove it (you'd be overwriting someone else's stuff)
             tty.warn("Keeping existing install prefix in place.")
@@ -1346,6 +1625,63 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             if not keep_prefix:
                 self.remove_prefix()
 
+            # The subprocess *may* have removed the build stage. Mark it
+            # not created so that the next time self.stage is invoked, we
+            # check the filesystem for it.
+            self.stage.created = False
+
+    def unit_test_check(self):
+        """Hook for unit tests to assert things about package internals.
+
+        Unit tests can override this function to perform checks after
+        ``Package.install`` and all post-install hooks run, but before
+        the database is updated.
+
+        The overridden function may indicate that the install procedure
+        should terminate early (before updating the database) by
+        returning ``False`` (or any value such that ``bool(result)`` is
+        ``False``).
+
+        Return:
+            (bool): ``True`` to continue, ``False`` to skip ``install()``
+        """
+        return True
+
+    def check_for_unfinished_installation(
+            self, keep_prefix=False, restage=False):
+        """Check for leftover files from partially-completed prior install to
+           prepare for a new install attempt. Options control whether these
+           files are reused (vs. destroyed). This function considers a package
+           fully-installed if there is a DB entry for it (in that way, it is
+           more strict than Package.installed). The return value is used to
+           indicate when the prefix exists but the install is not complete.
+        """
+        if self.spec.external:
+            raise ExternalPackageError("Attempted to repair external spec %s" %
+                                       self.spec.name)
+
+        with spack.store.db.prefix_write_lock(self.spec):
+            try:
+                record = spack.store.db.get_record(self.spec)
+                installed_in_db = record.installed if record else False
+            except KeyError:
+                installed_in_db = False
+
+            partial = False
+            if not installed_in_db and os.path.isdir(self.prefix):
+                if not keep_prefix:
+                    self.remove_prefix()
+                else:
+                    partial = True
+
+        stage_is_managed_in_spack = self.stage.path.startswith(
+            spack.paths.stage_path)
+        if restage and stage_is_managed_in_spack:
+            self.stage.destroy()
+            self.stage.create()
+
+        return partial
+
     def _do_install_pop_kwargs(self, kwargs):
         """Pops kwargs from do_install before starting the installation
 
@@ -1361,12 +1697,9 @@ class PackageBase(with_metaclass(PackageMeta, object)):
 
     def log(self):
         # Copy provenance into the install directory on success
-        log_install_path = spack.store.layout.build_log_path(
-            self.spec)
-        env_install_path = spack.store.layout.build_env_path(
-            self.spec)
-        packages_dir = spack.store.layout.build_packages_path(
-            self.spec)
+        log_install_path = spack.store.layout.build_log_path(self.spec)
+        env_install_path = spack.store.layout.build_env_path(self.spec)
+        packages_dir = spack.store.layout.build_packages_path(self.spec)
 
         # Remove first if we're overwriting another build
         # (can happen with spack setup)
@@ -1377,8 +1710,54 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             # FIXME : this potentially catches too many things...
             pass
 
+        # Archive the whole stdout + stderr for the package
         install(self.log_path, log_install_path)
+        # Archive the environment used for the build
         install(self.env_path, env_install_path)
+        # Finally, archive files that are specific to each package
+        with working_dir(self.stage.source_path):
+            errors = StringIO()
+            target_dir = os.path.join(
+                spack.store.layout.metadata_path(self.spec),
+                'archived-files')
+
+            for glob_expr in self.archive_files:
+                # Check that we are trying to copy things that are
+                # in the source_path tree (not arbitrary files)
+                abs_expr = os.path.realpath(glob_expr)
+                if os.path.realpath(self.stage.source_path) not in abs_expr:
+                    errors.write(
+                        '[OUTSIDE SOURCE PATH]: {0}\n'.format(glob_expr)
+                    )
+                    continue
+                # Now that we are sure that the path is within the correct
+                # folder, make it relative and check for matches
+                if os.path.isabs(glob_expr):
+                    glob_expr = os.path.relpath(
+                        glob_expr, self.stage.source_path
+                    )
+                files = glob.glob(glob_expr)
+                for f in files:
+                    try:
+                        target = os.path.join(target_dir, f)
+                        # We must ensure that the directory exists before
+                        # copying a file in
+                        mkdirp(os.path.dirname(target))
+                        install(f, target)
+                    except Exception:
+                        # Here try to be conservative, and avoid discarding
+                        # the whole install procedure because of copying a
+                        # single file failed
+                        errors.write('[FAILED TO ARCHIVE]: {0}'.format(f))
+
+            if errors.getvalue():
+                error_file = os.path.join(target_dir, 'errors.txt')
+                mkdirp(target_dir)
+                with open(error_file, 'w') as err:
+                    err.write(errors.getvalue())
+                tty.warn('Errors occurred when archiving files.\n\t'
+                         'See: {0}'.format(error_file))
+
         dump_packages(self.spec, packages_dir)
 
     def sanity_check_prefix(self):
@@ -1410,7 +1789,7 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         if self.installed:
             return spack.store.layout.build_log_path(self.spec)
         else:
-            return join_path(self.stage.source_path, 'spack-build.out')
+            return os.path.join(self.stage.source_path, 'spack-build.out')
 
     @property
     def module(self):
@@ -1520,6 +1899,47 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         """
         pass
 
+    def inject_flags(self, name, flags):
+        """
+        flag_handler that injects all flags through the compiler wrapper.
+        """
+        return (flags, None, None)
+
+    def env_flags(self, name, flags):
+        """
+        flag_handler that adds all flags to canonical environment variables.
+        """
+        return (None, flags, None)
+
+    def build_system_flags(self, name, flags):
+        """
+        flag_handler that passes flags to the build system arguments.  Any
+        package using `build_system_flags` must also implement
+        `flags_to_build_system_args`, or derive from a class that
+        implements it.  Currently, AutotoolsPackage and CMakePackage
+        implement it.
+        """
+        return (None, None, flags)
+
+    flag_handler = inject_flags
+    # The flag handler method is called for each of the allowed compiler flags.
+    # It returns a triple of inject_flags, env_flags, build_system_flags.
+    # The flags returned as inject_flags are injected through the spack
+    #  compiler wrappers.
+    # The flags returned as env_flags are passed to the build system through
+    #  the environment variables of the same name.
+    # The flags returned as build_system_flags are passed to the build system
+    #  package subclass to be turned into the appropriate part of the standard
+    #  arguments. This is implemented for build system classes where
+    #  appropriate and will otherwise raise a NotImplementedError.
+
+    def flags_to_build_system_args(self, flags):
+        # Takes flags as a dict name: list of values
+        if any(v for v in flags.values()):
+            msg = 'The {0} build system'.format(self.__class__.__name__)
+            msg += ' cannot take command line arguments for compiler flags'
+            raise NotImplementedError(msg)
+
     @staticmethod
     def uninstall_by_spec(spec, force=False):
         if not os.path.isdir(spec.prefix):
@@ -1534,14 +1954,15 @@ class PackageBase(with_metaclass(PackageMeta, object)):
                 raise InstallError(str(spec) + " is not installed.")
 
         if not force:
-            dependents = spack.store.db.installed_dependents(spec)
+            dependents = spack.store.db.installed_relatives(
+                spec, 'parents', True)
             if dependents:
                 raise PackageStillNeededError(spec, dependents)
 
         # Try to get the pcakage for the spec
         try:
             pkg = spec.package
-        except spack.repository.UnknownEntityError:
+        except spack.repo.UnknownEntityError:
             pkg = None
 
         # Pre-uninstall hook runs first.
@@ -1590,104 +2011,133 @@ class PackageBase(with_metaclass(PackageMeta, object)):
             raise ActivationError("%s does not extend %s!" %
                                   (self.name, self.extendee.name))
 
-    def do_activate(self, force=False):
+    def do_activate(self, view=None, with_dependencies=True, verbose=True):
         """Called on an extension to invoke the extendee's activate method.
 
         Commands should call this routine, and should not call
         activate() directly.
         """
-        self._sanity_check_extension()
+        if verbose:
+            tty.msg("Activating extension %s for %s" %
+                    (self.spec.cshort_spec, self.extendee_spec.cshort_spec))
 
-        spack.store.layout.check_extension_conflict(
+        self._sanity_check_extension()
+        if not view:
+            view = YamlFilesystemView(
+                self.extendee_spec.prefix, spack.store.layout)
+
+        extensions_layout = view.extensions_layout
+
+        extensions_layout.check_extension_conflict(
             self.extendee_spec, self.spec)
 
         # Activate any package dependencies that are also extensions.
-        if not force:
+        if with_dependencies:
             for spec in self.dependency_activations():
-                if not spec.package.activated:
-                    spec.package.do_activate(force=force)
+                if not spec.package.is_activated(view):
+                    spec.package.do_activate(
+                        view, with_dependencies=with_dependencies,
+                        verbose=verbose)
 
-        self.extendee_spec.package.activate(self, **self.extendee_args)
+        self.extendee_spec.package.activate(
+            self, view, **self.extendee_args)
 
-        spack.store.layout.add_extension(self.extendee_spec, self.spec)
-        tty.msg("Activated extension %s for %s" %
-                (self.spec.short_spec, self.extendee_spec.format("$_$@$+$%@")))
+        extensions_layout.add_extension(self.extendee_spec, self.spec)
+
+        if verbose:
+            tty.msg(
+                "Activated extension %s for %s" %
+                (self.spec.short_spec,
+                 self.extendee_spec.cformat("$_$@$+$%@")))
 
     def dependency_activations(self):
         return (spec for spec in self.spec.traverse(root=False, deptype='run')
                 if spec.package.extends(self.extendee_spec))
 
-    def activate(self, extension, **kwargs):
-        """Symlinks all files from the extension into extendee's install dir.
-
-        Package authors can override this method to support other
-        extension mechanisms.  Spack internals (commands, hooks, etc.)
-        should call do_activate() method so that proper checks are
-        always executed.
-
+    def activate(self, extension, view, **kwargs):
         """
+        Add the extension to the specified view.
 
-        def ignore(filename):
-            return (filename in spack.store.layout.hidden_file_paths or
-                    kwargs.get('ignore', lambda f: False)(filename))
+        Package authors can override this function to maintain some
+        centralized state related to the set of activated extensions
+        for a package.
 
-        tree = LinkTree(extension.prefix)
-        conflict = tree.find_conflict(self.prefix, ignore=ignore)
-        if conflict:
-            raise ExtensionConflictError(conflict)
+        Spack internals (commands, hooks, etc.) should call
+        do_activate() method so that proper checks are always executed.
+        """
+        view.merge(extension.spec, ignore=kwargs.get('ignore', None))
 
-        tree.merge(self.prefix, ignore=ignore)
+    def do_deactivate(self, view=None, **kwargs):
+        """Remove this extension package from the specified view. Called
+        on the extension to invoke extendee's deactivate() method.
 
-    def do_deactivate(self, **kwargs):
-        """Called on the extension to invoke extendee's deactivate() method."""
+        `remove_dependents=True` deactivates extensions depending on this
+        package instead of raising an error.
+        """
         self._sanity_check_extension()
         force = kwargs.get('force', False)
+        verbose = kwargs.get("verbose", True)
+        remove_dependents = kwargs.get("remove_dependents", False)
+
+        if not view:
+            view = YamlFilesystemView(
+                self.extendee_spec.prefix, spack.store.layout)
+        extensions_layout = view.extensions_layout
 
         # Allow a force deactivate to happen.  This can unlink
         # spurious files if something was corrupted.
         if not force:
-            spack.store.layout.check_activated(
+            extensions_layout.check_activated(
                 self.extendee_spec, self.spec)
 
-            activated = spack.store.layout.extension_map(
+            activated = extensions_layout.extension_map(
                 self.extendee_spec)
             for name, aspec in activated.items():
                 if aspec == self.spec:
                     continue
                 for dep in aspec.traverse(deptype='run'):
                     if self.spec == dep:
-                        msg = ("Cannot deactivate %s because %s is activated "
-                               "and depends on it.")
-                        raise ActivationError(
-                            msg % (self.spec.short_spec, aspec.short_spec))
+                        if remove_dependents:
+                            aspec.package.do_deactivate(**kwargs)
+                        else:
+                            msg = ("Cannot deactivate %s because %s is "
+                                   "activated and depends on it.")
+                            raise ActivationError(
+                                msg % (self.spec.cshort_spec,
+                                       aspec.cshort_spec))
 
-        self.extendee_spec.package.deactivate(self, **self.extendee_args)
+        self.extendee_spec.package.deactivate(
+            self, view, **self.extendee_args)
 
         # redundant activation check -- makes SURE the spec is not
         # still activated even if something was wrong above.
-        if self.activated:
-            spack.store.layout.remove_extension(
+        if self.is_activated(view):
+            extensions_layout.remove_extension(
                 self.extendee_spec, self.spec)
 
-        tty.msg("Deactivated extension %s for %s" %
-                (self.spec.short_spec, self.extendee_spec.format("$_$@$+$%@")))
+        if verbose:
+            tty.msg(
+                "Deactivated extension %s for %s" %
+                (self.spec.short_spec,
+                 self.extendee_spec.cformat("$_$@$+$%@")))
 
-    def deactivate(self, extension, **kwargs):
-        """Unlinks all files from extension out of this package's install dir.
+    def deactivate(self, extension, view, **kwargs):
+        """
+        Remove all extension files from the specified view.
 
         Package authors can override this method to support other
         extension mechanisms.  Spack internals (commands, hooks, etc.)
         should call do_deactivate() method so that proper checks are
         always executed.
-
         """
+        view.unmerge(extension.spec, ignore=kwargs.get('ignore', None))
 
-        def ignore(filename):
-            return (filename in spack.store.layout.hidden_file_paths or
-                    kwargs.get('ignore', lambda f: False)(filename))
-
-        tree = LinkTree(extension.prefix)
-        tree.unmerge(self.prefix, ignore=ignore)
+    def view(self):
+        """Create a view with the prefix of this package as the root.
+        Extensions added to this view will modify the installation prefix of
+        this package.
+        """
+        return YamlFilesystemView(self.prefix, spack.store.layout)
 
     def do_restage(self):
         """Reverts expanded/checked out source to a pristine state."""
@@ -1726,12 +2176,12 @@ class PackageBase(with_metaclass(PackageMeta, object)):
         """Try to find remote versions of this package using the
            list_url and any other URLs described in the package file."""
         if not self.all_urls:
-            raise VersionFetchError(self.__class__)
+            raise spack.util.web.VersionFetchError(self.__class__)
 
         try:
             return spack.util.web.find_versions_of_archive(
                 self.all_urls, self.list_url, self.list_depth)
-        except spack.error.NoNetworkConnectionError as e:
+        except spack.util.web.NoNetworkConnectionError as e:
             tty.die("Package.fetch_versions couldn't connect to:", e.url,
                     e.message)
 
@@ -1853,12 +2303,12 @@ def dump_packages(spec, path):
     # Note that we copy them in as they are in the *install* directory
     # NOT as they are in the repository, because we want a snapshot of
     # how *this* particular build was done.
-    for node in spec.traverse(deptype=spack.alldeps):
+    for node in spec.traverse(deptype=all):
         if node is not spec:
             # Locate the dependency package in the install tree and find
             # its provenance information.
             source = spack.store.layout.build_packages_path(node)
-            source_repo_root = join_path(source, node.namespace)
+            source_repo_root = os.path.join(source, node.namespace)
 
             # There's no provenance installed for the source package.  Skip it.
             # User can always get something current from the builtin repo.
@@ -1867,25 +2317,25 @@ def dump_packages(spec, path):
 
             # Create a source repo and get the pkg directory out of it.
             try:
-                source_repo = spack.repository.Repo(source_repo_root)
+                source_repo = spack.repo.Repo(source_repo_root)
                 source_pkg_dir = source_repo.dirname_for_package_name(
                     node.name)
-            except RepoError:
+            except spack.repo.RepoError:
                 tty.warn("Warning: Couldn't copy in provenance for %s" %
                          node.name)
 
         # Create a destination repository
-        dest_repo_root = join_path(path, node.namespace)
+        dest_repo_root = os.path.join(path, node.namespace)
         if not os.path.exists(dest_repo_root):
-            spack.repository.create_repo(dest_repo_root)
-        repo = spack.repository.Repo(dest_repo_root)
+            spack.repo.create_repo(dest_repo_root)
+        repo = spack.repo.Repo(dest_repo_root)
 
         # Get the location of the package in the dest repo.
         dest_pkg_dir = repo.dirname_for_package_name(node.name)
         if node is not spec:
             install_tree(source_pkg_dir, dest_pkg_dir)
         else:
-            spack.repo.dump_provenance(node, dest_pkg_dir)
+            spack.repo.path.dump_provenance(node, dest_pkg_dir)
 
 
 def print_pkg(message):
@@ -1954,15 +2404,6 @@ class PackageVersionError(PackageError):
             "Please provide a url for this version in the package.py file.")
 
 
-class VersionFetchError(PackageError):
-    """Raised when a version URL cannot automatically be determined."""
-
-    def __init__(self, cls):
-        super(VersionFetchError, self).__init__(
-            "Cannot fetch versions for package %s " % cls.__name__ +
-            "because it does not define any URLs to fetch.")
-
-
 class NoURLError(PackageError):
     """Raised when someone tries to build a URL for a package with no URLs."""
 
@@ -1974,13 +2415,6 @@ class NoURLError(PackageError):
 class ExtensionError(PackageError):
 
     pass
-
-
-class ExtensionConflictError(ExtensionError):
-
-    def __init__(self, path):
-        super(ExtensionConflictError, self).__init__(
-            "Extension blocked by file: %s" % path)
 
 
 class ActivationError(ExtensionError):
